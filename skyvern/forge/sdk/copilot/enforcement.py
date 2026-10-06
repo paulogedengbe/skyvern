@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 import structlog
 from agents.exceptions import MaxTurnsExceeded
+from agents.items import TResponseInputItem
 from agents.memory.session import Session
 from agents.model_settings import ModelSettings
 from agents.run import Runner
@@ -93,6 +94,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotActionRelation, ScreenshotEntry
+from skyvern.forge.sdk.copilot.steer import take_steer_input, watch_for_steer
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
     outcome_criteria_evaluated,
@@ -137,6 +139,11 @@ SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to sav
 FINAL_REPLY_OBSERVATION = (
     NUDGE_SENTINEL + "Your last response was empty. Tools are unavailable for this one response; "
     "reply to the user now with your final response for this turn."
+)
+RAW_SECRET_REPLY_WITHHELD_OBSERVATION = (
+    NUDGE_SENTINEL + "Your last reply was not shown to the user. The output check withheld it because it contained "
+    "text shaped like a raw secret: a value written after a password, passcode, secret, API key, or token label. "
+    "Tools are unavailable for this one response; reply to the user now with your final response for this turn."
 )
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
@@ -797,6 +804,13 @@ def _summarize_tool_output(output: str) -> str:
     # the user just told it. MCP results are excluded so a server cannot opt out of compaction.
     if MCP_RESULT_PROVENANCE_KEY not in parsed and "interaction_id" in parsed and isinstance(parsed.get("parts"), list):
         return output
+    # An account group result is the only record of which runs exist and what each did.
+    if (
+        MCP_RESULT_PROVENANCE_KEY not in parsed
+        and "workflow_run_group_id" in parsed
+        and isinstance(parsed.get("rows"), list)
+    ):
+        return output
 
     synopsis: dict[str, Any] = {}
     # Compaction must not launder untrusted MCP data into unlabelled context. The owned value is
@@ -987,6 +1001,30 @@ def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
         if _item_field(items[index], "type") == "function_call_output":
             unread.add(index)
     return unread
+
+
+def stable_prefix_anchor(items: Sequence[TResponseInputItem]) -> int | None:
+    """Return the index of the last tool output or real user message that precedes both the compaction window and
+    every unpruned screenshot. Later model calls resend every item up to that index unchanged."""
+    fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
+    fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
+    unstable = {
+        *fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+        *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+        *unread_tool_output_indices(items),
+        *(
+            i
+            for i, item in enumerate(items)
+            if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
+        ),
+    }
+    for index in range(min(unstable, default=len(items)) - 1, -1, -1):
+        item = items[index]
+        if _item_field(item, "type") == "function_call_output" or (
+            _item_field(item, "role") == "user" and not is_synthetic_user_message(item)
+        ):
+            return index
+    return None
 
 
 def _prune_input_list(items: list[Any]) -> list[Any]:
@@ -1279,6 +1317,8 @@ async def _run_streamed_with_deadline(
     runner_kwargs: dict[str, Any],
     start_time: float,
     iteration: int,
+    *,
+    watch_steer: bool = False,
 ) -> Any:
     """Run ``Runner.run_streamed`` + ``stream_to_sse`` under the hard watchdog.
 
@@ -1307,12 +1347,17 @@ async def _run_streamed_with_deadline(
                 result.cancel(mode="after_turn")
 
         ctx.check_model_work_deadline = None if ctx.budget_expiry_state.drain_active else check_model_work_deadline
+        steer_watcher = asyncio.create_task(watch_for_steer(result, ctx)) if watch_steer else None
         try:
             try:
                 async with asyncio.timeout(remaining) as deadline:
                     ctx.model_stream_deadline = deadline
                     await streaming_adapter.stream_to_sse(result, tracked_stream, ctx)
             finally:
+                if steer_watcher is not None:
+                    steer_watcher.cancel()
+                    await asyncio.wait({steer_watcher})
+                ctx.model_call_in_flight = False
                 ctx.model_stream_deadline = None
                 ctx.check_model_work_deadline = None
                 # A request_credential call the SDK rejected before its handler ran leaves the gate
@@ -1393,6 +1438,7 @@ async def run_final_reply_drain(
     session: Session | None,
     hooks: FinalReplyRunHooks,
     run_config: RunConfig,
+    observation: str = FINAL_REPLY_OBSERVATION,
 ) -> RunResultStreaming:
     reply_run_config = replace(
         run_config,
@@ -1404,7 +1450,7 @@ async def run_final_reply_drain(
     try:
         return await _run_streamed_with_deadline(
             agent,
-            FINAL_REPLY_OBSERVATION,
+            observation,
             ctx,
             session,
             _SendTrackingStream(stream),
@@ -1990,6 +2036,7 @@ async def run_with_enforcement(
                     current_runner_kwargs,
                     start_time,
                     iteration,
+                    watch_steer=True,
                 )
             except asyncio.CancelledError:
                 _record_copilot_cancellation(ctx, start_time, iteration)
@@ -2045,6 +2092,7 @@ async def run_with_enforcement(
                         current_runner_kwargs,
                         start_time,
                         iteration,
+                        watch_steer=True,
                     )
                 except asyncio.CancelledError:
                     _record_copilot_cancellation(ctx, start_time, iteration)
@@ -2083,6 +2131,14 @@ async def run_with_enforcement(
                 iteration,
                 "deadline",
             )
+
+        steer_input = await take_steer_input(ctx)
+        if steer_input:
+            current_input = (
+                steer_input if session is not None else _prune_input_list(result.to_input_list()) + steer_input
+            )
+            iteration += 1
+            continue
 
         # The post-run screenshot drain must follow the enforcement check:
         # without a nudge, re-invoking with just the screenshot would replace

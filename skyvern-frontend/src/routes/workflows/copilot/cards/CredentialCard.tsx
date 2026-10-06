@@ -61,7 +61,16 @@ export type CredentialRequiredReason =
   | "assistant_directed"
   | "missing_credential_run_failure"
   | "credential_missing_totp"
-  | "credential_rejected_by_site";
+  | "credential_rejected_by_site"
+  | "credential_registration";
+
+// What Generate and save would store. Never carries a password; the server generates it.
+export interface CredentialRegistrationDetails {
+  username: string;
+  credential_name: string;
+  attempted?: boolean;
+  outcome?: "rejected" | "unknown" | "created_not_connected" | null;
+}
 
 export interface CredentialRequiredFrame {
   type: "credential_required";
@@ -74,12 +83,18 @@ export interface CredentialRequiredFrame {
   credential_refs?: string[];
   timeout_seconds?: number;
   expires_at?: string;
+  signing_in?: boolean;
+  registration?: CredentialRegistrationDetails | null;
   timestamp?: string;
 }
 
 export type CredentialCardMode = "terminal" | "inline-pause" | "auto-bound";
 
-export type CredentialPauseOutcome = "connected" | "skipped" | "timeout";
+export type CredentialPauseOutcome =
+  | "connected"
+  | "skipped"
+  | "timeout"
+  | "signed_in";
 
 export interface CredentialPauseHistorical {
   outcome: CredentialPauseOutcome;
@@ -128,6 +143,20 @@ export interface CredentialCardProps {
   canChange?: boolean;
   // Set when the chat docks this ask above the composer instead of in the transcript.
   tray?: AttentionTrayPresentation;
+  // Offered only when the card's browser is the one on screen, so the user signs in where the agent looks.
+  signIn?: ManualSignInOffer;
+  // Registration cards only: saves a server-generated password under the frame's username and name.
+  onGenerate?: () => void;
+}
+
+export interface ManualSignInOffer {
+  busy: boolean;
+  // Set after a Done that found no sign-in cookies for the site.
+  notFoundHost?: string;
+  // Set after a Done whose sign-in could not be read or saved.
+  saveFailed?: boolean;
+  onStart: () => void;
+  onDone: () => void;
 }
 
 const SIGN_IN_WHY_LINE =
@@ -156,6 +185,8 @@ export const CREDENTIAL_WHY_LINE_BY_REASON: Record<
     "This saved login has no 2FA method, so the workflow can't pass the verification step. Add one in the credential editor — codes never go through chat.",
   credential_rejected_by_site:
     "Update the saved password or one-time code here and I'll try the sign-in again.",
+  credential_registration:
+    "Generate and save creates a strong password and stores it in your credentials — it never appears in chat. Saving it does not create the account; I'll still submit the sign-up form.",
 };
 
 // Mirrors the credentials route: it caps `search` at 200 characters and pages at 100. A longer term
@@ -191,6 +222,8 @@ const UPDATE_SKIP_OUTCOME = {
   meta: "keeps its saved sign-in",
   detail: "Credential not updated — the workflow keeps its saved sign-in.",
 };
+const SIGNED_IN_DETAIL =
+  "No password stored · your sign-in is saved as browser cookies in this profile";
 const TIMEOUT_OUTCOME = {
   title: "Sign-in request timed out",
   meta: "test may stop at login",
@@ -754,6 +787,8 @@ function CredentialAskCard({
   autoBound,
   canChange = false,
   tray,
+  signIn,
+  onGenerate,
 }: Readonly<CredentialCardProps>) {
   // Terminal mode never expires by design: its signal carries no timeout/expiry
   // semantics at all, so there is nothing to compare "now" against. Only a
@@ -905,7 +940,27 @@ function CredentialAskCard({
           />
         );
       case "timeout":
-        return <ResolvedCredentialCard tone="warn" {...TIMEOUT_OUTCOME} />;
+        return frame.registration?.outcome === "created_not_connected" ? (
+          <ResolvedCredentialCard
+            tone="warn"
+            title={`Saved as ${frame.registration.credential_name}, not connected`}
+            detail="The request ended before this login was connected. It is on the Credentials page."
+          />
+        ) : (
+          <ResolvedCredentialCard tone="warn" {...TIMEOUT_OUTCOME} />
+        );
+      case "signed_in":
+        return (
+          <ResolvedCredentialCard
+            tone="done"
+            title={
+              resolvedOutcome.name
+                ? `Signed in, saved as '${resolvedOutcome.name}'`
+                : "Signed in, saved as a browser profile"
+            }
+            detail={SIGNED_IN_DETAIL}
+          />
+        );
       case "connected": {
         const name = resolvedOutcome.name;
         // A save from the editor does not prove 2FA was added; the retried step says whether it was.
@@ -1017,12 +1072,125 @@ function CredentialAskCard({
   }
 
   const site = siteFromLoginPageUrls(frame.login_page_urls);
+  const registration = frame.registration ?? null;
+  const offerGenerate = Boolean(
+    registration && onGenerate && !registration.attempted,
+  );
+  const registrationLines = registration
+    ? [
+        <span key="destination" className="text-[11px] leading-relaxed">
+          Sign-up page: {frame.login_page_urls?.[0] ?? site}
+        </span>,
+        <span key="username" className="text-[11px] leading-relaxed">
+          Username: {registration.username}
+        </span>,
+        <span key="saved-as" className="text-[11px] leading-relaxed">
+          Saved as: {registration.credential_name}
+        </span>,
+        ...(registration.outcome
+          ? [
+              <span key="outcome" className="text-[11px] font-medium">
+                {registration.outcome === "rejected"
+                  ? "Nothing was saved — the credential couldn't be created. Pick or add a login instead."
+                  : registration.outcome === "created_not_connected"
+                    ? `Saved as ${registration.credential_name}, not connected.`
+                    : "The vault didn't confirm the save. Check your credentials before adding another."}
+              </span>,
+            ]
+          : []),
+      ]
+    : [];
+  const connectButton = (
+    <Button
+      type="button"
+      size="sm"
+      variant={
+        (signIn && frame.signing_in) || offerGenerate ? "outline" : "default"
+      }
+      disabled={disabled}
+      onClick={() => onConnect(undefined)}
+      data-tour="credential-connect"
+    >
+      Connect credential
+    </Button>
+  );
+  if (signIn && frame.signing_in) {
+    const notFound = signIn.saveFailed
+      ? "Couldn't save your sign-in. Click Done to try again, or connect a credential."
+      : signIn.notFoundHost
+        ? `No sign-in found for ${signIn.notFoundHost}. Sign in, then click Done again.`
+        : "";
+    return (
+      <AskChrome
+        tray={tray}
+        rootRef={rootRef}
+        message={frame.message}
+        title={`Sign in to ${site} in the browser`}
+        countdown={
+          <PauseCountdown remainingMs={remainingMs} expired={expired} />
+        }
+        lines={[
+          <span
+            key="how"
+            className="text-[11px] leading-relaxed text-muted-foreground"
+          >
+            Use the browser to sign in, including any verification code, then
+            click Done. Skyvern saves the sign-in as a browser profile; no
+            password is stored.
+          </span>,
+          ...(notFound
+            ? [
+                <span key="not-found" className="text-[11px] font-medium">
+                  {notFound}
+                </span>,
+              ]
+            : []),
+        ]}
+        footer={
+          <>
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled || signIn.busy}
+              onClick={signIn.onDone}
+            >
+              {signIn.busy ? "Saving sign-in…" : "Done"}
+            </Button>
+            {connectButton}
+            <div className="ml-auto">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => onSkip()}
+                disabled={disabled || signIn.busy}
+              >
+                Cancel
+              </Button>
+            </div>
+          </>
+        }
+        announcer={
+          <span
+            className="sr-only"
+            role={insideLiveRegion ? undefined : "status"}
+          >
+            {insideLiveRegion ? "" : notFound}
+          </span>
+        }
+      />
+    );
+  }
   return (
     <AskChrome
       tray={tray}
       rootRef={rootRef}
       message={frame.message}
-      title={`Copilot needs to sign in to ${site}`}
+      title={
+        registration
+          ? `Create a login for ${site}`
+          : `Copilot needs to sign in to ${site}`
+      }
       countdown={
         countdownActive ? (
           <PauseCountdown remainingMs={remainingMs} expired={expired} />
@@ -1035,6 +1203,7 @@ function CredentialAskCard({
         >
           {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason] ?? SIGN_IN_WHY_LINE}
         </span>,
+        ...registrationLines,
         ...(mode === "terminal"
           ? [
               <span
@@ -1048,15 +1217,28 @@ function CredentialAskCard({
       ]}
       footer={
         <>
-          <Button
-            type="button"
-            size="sm"
-            disabled={disabled}
-            onClick={() => onConnect(undefined)}
-            data-tour="credential-connect"
-          >
-            Connect credential
-          </Button>
+          {offerGenerate ? (
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled}
+              onClick={() => onGenerate?.()}
+            >
+              Generate and save
+            </Button>
+          ) : null}
+          {connectButton}
+          {signIn ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={disabled || signIn.busy}
+              onClick={signIn.onStart}
+            >
+              Sign in myself
+            </Button>
+          ) : null}
           {orgCredentials.status === "ready" &&
           (pickable.length > 0 || pickerEngaged) ? (
             <CredentialPicker

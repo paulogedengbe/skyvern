@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote, urlparse
 
 import pytest
+import yaml
 from agents.mcp.util import MCPUtil
 from agents.tool_context import ToolContext
 from fastmcp import FastMCP
@@ -25,7 +27,7 @@ from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.config import AGENT_BLOCKS_ONLY, BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM
 from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError
 from skyvern.forge.sdk.copilot.mcp_adapter import (
@@ -61,7 +63,14 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, mcp_hooks
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
-from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.copilot.tools.banned_blocks import _block_authoring_violations
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
+    _FOR_LOOP_EXAMPLE,
+    _FOR_LOOP_GUIDANCE,
+    _FOR_LOOP_PROPERTY_DESCRIPTIONS,
+    _build_skyvern_mcp_overlays,
+    get_skyvern_mcp_alias_map,
+)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
@@ -433,7 +442,6 @@ _PAYLOAD_KEYS_THAT_WOULD_LEAK = {"args", "merged_args", "arguments", "mcp_args",
 _BROWSER_BOOT_SECONDS = 2.0
 _MCP_CALL_SECONDS = 3.0
 _AFTER_CALL_SECONDS = 5.0
-_AFTER_CALL_MS = 5000
 _WALL_MS = 5000
 _SESSION_ONLY_MS = 2000
 _MCP_CALL_MS = 3000
@@ -1128,28 +1136,19 @@ class TestSharedBrowserCallOutcome:
         assert second["data"]["metadata"]["width"] == 1280
 
     @pytest.mark.asyncio
-    async def test_typed_internal_accessor_preserves_legacy_dict_and_drain_incomplete(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_typed_internal_accessor_preserves_legacy_dict(self) -> None:
         payload = {"ok": True, "data": {"result": {"count": 3}}}
         server = self._server(
             model_tool_name="evaluate",
             raw_tool_name="skyvern_evaluate",
             payload=payload,
         )
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _failed_drain() -> None:
-            raise RuntimeError("drain failed")
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _failed_drain)
 
         typed = await server.call_internal_browser_tool("skyvern_evaluate", {"expression": "scan()"})
         legacy = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
 
         assert typed.result == legacy == mcp_to_copilot(payload)
         assert typed.outcome.dispatched is True
-        assert typed.outcome.evidence_drain_complete is False
         assert typed.outcome.source_browser_session_generation == 0
 
     @pytest.mark.asyncio
@@ -1560,16 +1559,10 @@ class TestSharedBrowserCallOutcome:
 class TestMCPToolTiming:
     @pytest.mark.asyncio
     async def test_internal_call_logs_the_server_total_without_changing_the_result(
-        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+        self, _fake_clock: list[float]
     ) -> None:
         payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"sdk": 812, "total": 815}}
         server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _slow_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _slow_drain)
 
         with capture_logs() as captured:
             result = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
@@ -2041,7 +2034,6 @@ class TestMCPToolTiming:
         record = _timing_records(captured)[0]
         assert record["call_status"] == "error"
         assert record["timing_phase"] is None
-        assert record["post_call_evidence_drain_ms"] is None
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio
@@ -2171,71 +2163,6 @@ class TestMCPToolTiming:
         record = _timing_records(captured)[0]
         assert record["phase_dispatch_untimed_ms"] is None
         assert record["timing_server_overrun"] is True
-        _assert_every_millisecond_is_attributed(record)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("failure", "call_status"),
-        [
-            (asyncio.CancelledError(), "cancelled"),
-            (CopilotBrowserSessionUnavailable("pbs_1"), "session_error"),
-            (RuntimeError("drain exploded"), "error"),
-        ],
-        ids=["cancelled", "session_error", "error"],
-    )
-    async def test_an_evidence_drain_that_fails_still_reports_the_budget_it_spent(
-        self,
-        failure: BaseException,
-        call_status: str,
-        monkeypatch: pytest.MonkeyPatch,
-        _fake_clock: list[float],
-    ) -> None:
-        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
-        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-        server._context_provider().browser_session_replacements = {"pbs_1": "pbs_replacement"}
-
-        async def _failing_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-            raise failure
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _failing_drain)
-
-        with capture_logs() as captured:
-            if isinstance(failure, asyncio.CancelledError):
-                with pytest.raises(asyncio.CancelledError):
-                    await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-            else:
-                await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == call_status
-        assert record["wall_clock_ms"] == _WALL_MS
-        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
-        assert record["phase_residual_ms"] == 0
-        assert record["timing_phase"] == "evidence_drain"
-        _assert_every_millisecond_is_attributed(record)
-
-    @pytest.mark.asyncio
-    async def test_an_evidence_drain_that_succeeds_reports_what_the_caller_waited_for_it(
-        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
-    ) -> None:
-        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
-        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
-        server._evidence_candidate_origin = "https://public.test"
-
-        async def _slow_drain() -> None:
-            _fake_clock[0] += _AFTER_CALL_SECONDS
-
-        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _slow_drain)
-
-        with capture_logs() as captured:
-            await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
-
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == "ok"
-        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
-        assert record["wall_clock_ms"] == _WALL_MS
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio
@@ -3744,3 +3671,56 @@ async def test_actor_reason_actual_mcp_schema_alias_strips_only_metadata() -> No
         assert original == {"block_type": "code"}
     finally:
         await server.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_refusing_both_inputs() -> None:
+    ctx = make_copilot_ctx(api_key="in-process-test-key")
+    aliases = get_skyvern_mcp_alias_map()
+    names = ("get_block_schema", "get_workflow_knowledge")
+    server = SkyvernOverlayMCPServer(
+        transport=mcp,
+        overlays=_build_skyvern_mcp_overlays(),
+        alias_map={name: aliases[name] for name in names},
+        allowlist=frozenset(aliases[name] for name in names),
+        context_provider=lambda: ctx,
+    )
+    await server.connect()
+    try:
+        tools = {tool.name: tool for tool in await server.list_tools()}
+
+        async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            tool = MCPUtil.to_function_tool(tools[name], server, convert_schemas_to_strict=False)
+            tc = ToolContext(context=ctx, tool_name=name, tool_call_id=f"{name}-call", tool_arguments="{}")
+            output = await tool.on_invoke_tool(tc, json.dumps(arguments))
+            return json.loads(output["text"])["data"]
+
+        schema_data = await call("get_block_schema", {"block_type": "for_loop"})
+        knowledge = (await call("get_workflow_knowledge", {"topics": ["for_loop_block"]}))["sections"]["for_loop_block"]
+    finally:
+        await server.cleanup()
+
+    schema = schema_data["schema"]
+    properties = schema["$defs"][schema["$ref"].removeprefix("#/$defs/")]["properties"]
+    assert {name: properties[name]["description"] for name in _FOR_LOOP_PROPERTY_DESCRIPTIONS} == (
+        _FOR_LOOP_PROPERTY_DESCRIPTIONS
+    )
+    assert schema_data["example"] == _FOR_LOOP_EXAMPLE
+    producer, loop = schema_data["example"]["blocks"]
+    assert loop["loop_over_parameter_key"] == f"{producer['label']}_output"
+    assert "loop_variable_reference" not in loop
+    assert knowledge["content"] == _FOR_LOOP_GUIDANCE
+    assert all(description in _FOR_LOOP_GUIDANCE for description in _FOR_LOOP_PROPERTY_DESCRIPTIONS.values())
+    assert yaml.safe_load(_FOR_LOOP_GUIDANCE.partition("the list):\n")[2]) == _FOR_LOOP_EXAMPLE
+    assert {"loop_over_parameter_key", "loop_variable_reference"} <= set(properties)
+
+    both_inputs = {
+        "block_type": "for_loop",
+        "label": "visit_each_row",
+        "loop_over_parameter_key": "parse_rows_output",
+        "loop_variable_reference": "current_value",
+        "loop_blocks": [{"block_type": "goto_url", "label": "open_row_url", "url": "{{ current_value.url }}"}],
+    }
+    submitted = copy.deepcopy(both_inputs)
+    assert _block_authoring_violations(submitted, AGENT_BLOCKS_ONLY) == []
+    assert submitted == both_inputs

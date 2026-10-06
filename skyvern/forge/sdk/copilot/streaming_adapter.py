@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.narration import (
     tool_activity_display_label,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    browser_code_steps_for_user,
     format_tool_result_for_user,
     summarize_tool_result_detail,
     user_facing_success,
@@ -330,6 +331,7 @@ async def stream_to_sse(
                     LOG.warning("copilot_narrative_design_start_emit_failed", error=str(emit_err))
 
             if event.name == "tool_called":
+                ctx.model_call_streamed_tool_call = True
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = _get_raw_field(raw, "name") or "unknown"
@@ -450,6 +452,7 @@ async def stream_to_sse(
                     tool_result_ts = datetime.now(timezone.utc)
                     code_diffs = _drain_code_write_diffs(ctx, tool_name, call_id)
                     work_plan = _tool_result_work_plan(tool_name, parsed)
+                    browser_steps = browser_code_steps_for_user(tool_name, parsed)
                     narrator_state.record_activity(
                         _present_activity(
                             build_tool_result_activity(
@@ -461,6 +464,7 @@ async def stream_to_sse(
                                 timestamp=tool_result_ts,
                                 display_label=result_label,
                                 code_diffs=code_diffs,
+                                browser_steps=browser_steps,
                             ),
                             presentation,
                         )
@@ -483,6 +487,7 @@ async def stream_to_sse(
                                 tool_call_id=call_id,
                                 code_diffs=code_diffs,
                                 work_plan=work_plan,
+                                browser_steps=browser_steps,
                                 detail=detail,
                                 workflow_run_id=_tool_result_workflow_run_id(tool_name, parsed),
                                 executed_source_reference=_tool_result_executed_source_reference(tool_name, parsed),
@@ -608,6 +613,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
     flush_ts = datetime.now(timezone.utc)
     code_diffs = _drain_code_write_diffs(ctx, pending.tool_name, pending.call_id)
     work_plan = _tool_result_work_plan(pending.tool_name, parsed)
+    browser_steps = browser_code_steps_for_user(pending.tool_name, parsed)
     narrator_state = ctx.narrator_state
     if narrator_state is not None:
         narrator_state.record_activity(
@@ -621,6 +627,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
                     timestamp=flush_ts,
                     display_label=display_label,
                     code_diffs=code_diffs,
+                    browser_steps=browser_steps,
                 ),
                 pending,
             )
@@ -643,6 +650,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
             tool_call_id=pending.call_id,
             code_diffs=code_diffs,
             work_plan=work_plan,
+            browser_steps=browser_steps,
             detail=summarize_tool_result_detail(
                 parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals, success=success
             ),
@@ -893,6 +901,7 @@ async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> Non
             turn_index=ctx.turn_index,
             timestamp=now,
             prior_block_count=ctx.prior_block_count,
+            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
         )
     )
 

@@ -9,6 +9,7 @@ import {
   BudgetExpiryOutcome,
   ConnectedAccountChoice,
   CopilotResponseType,
+  CopilotSteerMessage,
   DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
@@ -20,6 +21,7 @@ import {
   WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
+  WorkflowCopilotSteerDeliveredUpdate,
   WorkflowCopilotToolCallUpdate,
   CodeWriteDiff,
   WorkflowCopilotToolResultUpdate,
@@ -120,6 +122,7 @@ export type NarrativeEvent =
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCodegenProgressUpdate
+  | WorkflowCopilotSteerDeliveredUpdate
   | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
@@ -347,6 +350,9 @@ export interface ActivityEntry {
   // Server-computed line delta per code block this write changed. Absent on
   // every other row and on payloads from a backend that predates it.
   codeDiffs?: CodeWriteDiff[];
+  // A successful run_browser_code result's operations as display phrases,
+  // in order. Absent on every other row.
+  browserSteps?: string[];
   // Stable per-event id used as React key.
   id: string;
   // Consecutive same-tool retries folded into this row by
@@ -434,7 +440,7 @@ export interface TurnNarrativeState {
   // Resolved pause outcome, from the credentialPause narrative signal.
   // "declined" means the pause engaged but never sent a frame, so no card.
   credentialPause: {
-    outcome: "connected" | "skipped" | "timeout" | "declined";
+    outcome: "connected" | "skipped" | "timeout" | "declined" | "signed_in";
     credentialId: string | null;
     // The tool call whose row was newest when the card was raised. Absent on
     // turns recorded before it was stamped.
@@ -452,6 +458,8 @@ export interface TurnNarrativeState {
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
   budgetExpiry: BudgetExpiryState | null;
+  // Messages the user sent into this turn, in the order the model received them.
+  steerMessages: CopilotSteerMessage[];
 }
 
 export interface GoogleConnectionNotice {
@@ -492,6 +500,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   review: null,
   turnFacts: null,
   budgetExpiry: null,
+  steerMessages: [],
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -561,7 +570,8 @@ export function parseCredentialPause(
     outcome !== "connected" &&
     outcome !== "skipped" &&
     outcome !== "timeout" &&
-    outcome !== "declined"
+    outcome !== "declined" &&
+    outcome !== "signed_in"
   ) {
     return null;
   }
@@ -577,7 +587,7 @@ export interface TurnWorkPlan {
   items: string[];
 }
 
-function parseWorkPlanItems(value: unknown): string[] | null {
+function parseStringList(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((item) => typeof item === "string")
     ? [...value]
     : null;
@@ -586,7 +596,7 @@ function parseWorkPlanItems(value: unknown): string[] | null {
 function parseTurnWorkPlan(value: unknown): TurnWorkPlan | null {
   if (!value || typeof value !== "object") return null;
   const o = value as Record<string, unknown>;
-  const items = parseWorkPlanItems(o.items);
+  const items = parseStringList(o.items);
   return typeof o.toolCallId === "string" && o.toolCallId && items
     ? { toolCallId: o.toolCallId, items }
     : null;
@@ -718,6 +728,8 @@ export const AUTHORING_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
 ]);
+export const ACCOUNT_GROUP_SUBMIT_TOOL = "run_workflow_for_accounts";
+
 export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
@@ -772,6 +784,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   list_credentials: "Checking saved credentials",
   get_organization_usage_quota: "Checking account usage",
   extend_browser_session: "Extending the browser session",
+  run_browser_code: "Working in the browser",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
   add_block: "Adding block",
@@ -780,6 +793,9 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   ask_user: "Asking you",
   set_work_plan: "Updating its plan",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
+  [ACCOUNT_GROUP_SUBMIT_TOOL]: "Reviewing the accounts with you",
+  get_account_group_status: "Checking the account runs",
+  cancel_account_group: "Reviewing a cancel with you",
 };
 
 // What kind of work a call did, for the activity log's per-step rollup. Keyed
@@ -813,6 +829,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   validate_block: "other",
   inspect_current_workflow: "other",
   list_integrations: "other",
+  read_google_sheet: "other",
   get_organization_usage_quota: "other",
   extend_browser_session: "other",
   search_web: "other",
@@ -827,6 +844,9 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   disable_workflow_schedule: "other",
   cancel_workflow_schedule: "other",
   delete_workflow_schedule: "other",
+  [ACCOUNT_GROUP_SUBMIT_TOOL]: "run",
+  get_account_group_status: "other",
+  cancel_account_group: "other",
 };
 
 export function toolCallKind(toolName: string): ToolCallKind {
@@ -909,6 +929,7 @@ function buildActivityFromToolResult(
     success: event.success,
     detail: event.detail || undefined,
     codeDiffs: parseCodeDiffs(event.code_diffs),
+    browserSteps: parseStringList(event.browser_steps) ?? undefined,
     reason: actionReason(event.reason),
     activityBucket: parseActivityBucket(event.activity_bucket),
     activityStartedAt: event.activity_started_at ?? undefined,
@@ -1515,8 +1536,21 @@ export function applyNarrativeEvent(
       };
     }
 
+    case "steer_delivered": {
+      const known = new Set(prev.steerMessages.map((item) => item.steer_id));
+      return {
+        ...prev,
+        steerMessages: [
+          ...prev.steerMessages,
+          ...event.steer_messages.filter((item) => !known.has(item.steer_id)),
+        ],
+        // A delivery can abort the model call those drafting frames described.
+        codegenProgress: null,
+      };
+    }
+
     case "tool_result": {
-      const planItems = parseWorkPlanItems(event.work_plan);
+      const planItems = parseStringList(event.work_plan);
       const workPlan = planItems
         ? { toolCallId: event.tool_call_id, items: planItems }
         : prev.workPlan;
@@ -1591,6 +1625,10 @@ export function applyNarrativeEvent(
         return {
           ...hydrated,
           blocks,
+          steerMessages:
+            hydrated.steerMessages.length > 0
+              ? hydrated.steerMessages
+              : prev.steerMessages,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:
@@ -1685,6 +1723,7 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
         typeof o.activeLabel === "string" ? o.activeLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
+      browserSteps: parseStringList(o.browserSteps) ?? undefined,
       id: o.id,
       reason: actionReason(o.reason),
       activityBucket: parseActivityBucket(o.activityBucket),
@@ -1981,7 +2020,20 @@ export function hydrateNarrativeFromPayload(
     review: parseReviewProjection(payload.review),
     turnFacts,
     budgetExpiry,
+    steerMessages: parseSteerMessages(payload.steerMessages),
   };
+}
+
+function parseSteerMessages(value: unknown): CopilotSteerMessage[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is CopilotSteerMessage =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof item.steer_id === "string" &&
+      typeof item.text === "string" &&
+      typeof item.delivered_at === "string",
+  );
 }
 
 // History rows persisted before narrative_payload carried responseKind still

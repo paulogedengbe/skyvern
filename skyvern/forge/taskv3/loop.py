@@ -70,11 +70,16 @@ ToolErrorClass = Literal[
     "ref_not_in_latest",
     "stale_mark",
     "mark_not_in_latest",
+    # A guessed menu number on an open menu whose rows were withheld, so never numbered.
+    "rows_unlisted",
     # The target resolved, but the page will not let the act happen.
     "disabled",
     "not_editable",
     # `type`: the page replaced the typed text with a non-empty value of its own; left in place.
     "value_changed_by_page",
+    # `type`: another segment of the same date moved and could not be put back, or could not be read back.
+    "date_sibling_moved",
+    "date_sibling_unverified",
     # `type`: the field does not hold the typed text afterwards -- an append that is partial or unchanged, or a
     # one-character-per-box code field whose boxes did not all keep their character.
     "text_not_held",
@@ -1988,6 +1993,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "turn",
         "batch_size",
         "batch_index",
+        "tool_call_seq",
         "action_key_hash",
         "snapshot_digest",
         "probe_first_time",
@@ -2263,7 +2269,12 @@ def _menu_note_record_fields(tool_name: str, result: ToolResult | None) -> dict[
         if isinstance(rows, int) and not isinstance(rows, bool):
             fields["menu_rows"] = rows
         reason = data.get("withhold_reason")
-        if note == "withheld" and reason in ("declared_row_over_caps", "bare_text_beside", "single_row_pieces"):
+        if note == "withheld" and reason in (
+            "declared_row_over_caps",
+            "bare_text_beside",
+            "single_row_pieces",
+            "long_row_unread",
+        ):
             fields["withhold_reason"] = reason
     return fields
 
@@ -2661,7 +2672,9 @@ def make_finish_tool(
                     "the page was still rendering, or could not be verified as settled, when you "
                     "called finish. Wait for it to settle, re-observe, confirm the goal's effect is "
                     "present in the loaded content (not a loading indicator or empty container), "
-                    "then finish again."
+                    f"then finish again. This check holds a finish at most {max_settle_deferrals} times, so a page "
+                    "that keeps changing on its own (a clock, countdown or ticker) is not by itself a reason to "
+                    "report failure."
                 )
         if status == "completed" and goal_check is not None:
             try:
@@ -3203,6 +3216,8 @@ class LoopState:
     # A single-action block's completion is offered through the finish tool at most once: a guard that
     # holds a verdict only once would pass a second offer the model never saw it hold.
     block_completion_offered: bool = False
+    # A billable action that succeeded moved the tab's URL: evidence the block's action took effect.
+    block_action_transitioned: bool = False
 
 
 async def run_agent_tool_loop(
@@ -3276,6 +3291,8 @@ async def run_agent_tool_loop(
     # A block whose contract is one action: once one succeeded, a follow-up the step cap refuses offers
     # finish(completed) instead of failing the block, as the step engine completes it after that step.
     single_action_block: bool = False,
+    # The goal judge's verdict on that completion; the completion is offered only on its grounded "achieved".
+    block_completion_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -4287,23 +4304,50 @@ async def run_agent_tool_loop(
                         and not st.block_completion_offered
                     ):
                         st.block_completion_offered = True
-                        block_reason = (
-                            f"performed the block's action ({st.billable_actions[0]}); "
-                            "a further action was past the block's step limit"
+                        # A successful action that moved nothing (a no-op click, a username typed before the
+                        # login submits) is no sign the block is done, and a URL change can land on the wrong page
+                        # or the next step of the same form. Every failure to reach a grounded "achieved" fails closed.
+                        block_verdict: GoalVerdict | None = None
+                        judge_skipped: str | None = None
+                        if st.block_action_transitioned:
+                            if block_completion_check is None:
+                                judge_skipped = "no_judge"
+                            else:
+                                try:
+                                    block_verdict = await block_completion_check()
+                                    judge_skipped = block_verdict.skipped_reason
+                                except Exception:
+                                    LOG.warning("taskv3 block completion judge raised", exc_info=True)
+                                    judge_skipped = "judge_error"
+                        judged = block_verdict if judge_skipped is None else None
+                        LOG.info(
+                            "taskv3 block completion evidence",
+                            url_changed=st.block_action_transitioned,
+                            billable_actions=st.billable_actions,
+                            judge_verdict=judged.verdict if judged is not None else None,
+                            judge_skipped_reason=judge_skipped,
+                            judge_latency_s=block_verdict.latency_s if block_verdict is not None else None,
                         )
-                        # Through the real handler, so every guard on a completed verdict still applies.
-                        try:
-                            block_finish = await finish_spec.handler({"status": "completed", "reason": block_reason})
-                        except Exception:
-                            LOG.warning("taskv3 block completion finish raised", exc_info=True)
-                            block_finish = ToolResult.error("")
-                        if activity is not None:
-                            activity.held_verdict_batch_skip = False
-                        if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
-                            st.outcome = LoopOutcome("completed", block_reason)
-                            break
-                        if block_finish.status == "error":
-                            block_refusal = block_finish.content
+                        if judged is not None and judged.verdict == "achieved":
+                            block_reason = (
+                                f"performed the block's action ({st.billable_actions[0]}); "
+                                "a further action was past the block's step limit"
+                            )
+                            # Through the real handler, so every guard on a completed verdict still applies.
+                            try:
+                                block_finish = await finish_spec.handler(
+                                    {"status": "completed", "reason": block_reason}
+                                )
+                            except Exception:
+                                LOG.warning("taskv3 block completion finish raised", exc_info=True)
+                                block_finish = ToolResult.error("")
+                            if activity is not None:
+                                activity.held_verdict_batch_skip = False
+                            if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
+                                st.outcome = LoopOutcome("completed", block_reason)
+                                break
+                            if block_finish.status == "error":
+                                block_refusal = block_finish.content
                     # Unlike the mid-batch max_tool_calls check above, the step gate is NOT special-cased
                     # away once the final turn is granted: a billable dispatch on the granted turn still
                     # hits it, which is the honest exit the grant exists to produce.
@@ -4597,6 +4641,8 @@ async def run_agent_tool_loop(
                 turn=st.turns,
                 batch_size=len(tool_calls),
                 batch_index=idx,
+                # What current_tool_call_seq() returned inside this call, so a tool's own lines join here.
+                tool_call_seq=st.total_tool_calls,
                 **cost_fields,
                 **observe_summary,
                 **navigate_fields,
@@ -4830,6 +4876,13 @@ async def run_agent_tool_loop(
                 )
                 if spec.billable and result.status == "ok":
                     st.billable_actions.append(tool_name)
+                    # click reports it at the top level, navigate inside its action outcome. A navigation that
+                    # landed on an error page moved the URL without doing the block's action.
+                    if not _outcome_reports_failure(round_outcome) and (
+                        result_data.get("page_transitioned") is True
+                        or (round_outcome or {}).get("page_transitioned") is True
+                    ):
+                        st.block_action_transitioned = True
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
                     activity.last_trigger_turn = st.turns
                     activity.failure_evidence_trigger_generation += 1

@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 import structlog
-from sqlalchemy import cast, func, or_, select
+from sqlalchemy import cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import defer
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.ask_user import (
     QUESTION_CLIENT_GRACE,
+    AccountGroupDecision,
     QuestionInteraction,
     QuestionResponse,
     question_wait_is_live,
@@ -24,7 +27,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_js
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
-from skyvern.forge.sdk.db.base_alchemy_db import read_with_disconnect_recovery
+from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory, read_with_disconnect_recovery
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.exceptions import (
@@ -67,10 +70,12 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_METADATA_KEY,
+    MAX_STEER_MESSAGES_PER_TURN,
     CopilotAttachedFile,
     CopilotCandidateDisposition,
     CopilotPendingTurn,
     CopilotProposalMetadata,
+    CopilotSteerMessage,
     CopilotVideoEvidenceArtifact,
     NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
@@ -101,6 +106,19 @@ from skyvern.webeye.actions.actions import Action
 LOG = structlog.get_logger()
 
 PENDING_TURN_RETENTION = timedelta(days=30)
+# ponytail: SQLite has no advisory locks and runs in one process, so an in-process set stands in.
+_SQLITE_FINALISING_TURNS: set[str] = set()
+
+
+def _turn_finalisation_lock_key(workflow_copilot_chat_id: str, turn_id: str) -> str:
+    return f"copilot_turn_finalisation:{workflow_copilot_chat_id}:{turn_id}"
+
+
+async def _turn_finalisation_held(session: AsyncSession, key: str) -> bool:
+    if session.bind is not None and session.bind.dialect.name == "sqlite":
+        return key in _SQLITE_FINALISING_TURNS
+    acquired = await session.scalar(text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"), {"key": key})
+    return not acquired
 
 
 def _pending_turn_id_for_idempotency_digest(
@@ -273,6 +291,16 @@ def _dump_attached_files(attached_files: list[CopilotAttachedFile] | None) -> li
 
 class WorkflowParametersRepository(BaseRepository):
     """Database operations for workflow parameters, copilot chat, task generation, actions, and runs."""
+
+    def __init__(
+        self,
+        session_factory: _SessionFactory,
+        debug_enabled: bool = False,
+        is_retryable_error_fn: Callable[[SQLAlchemyError], bool] | None = None,
+        db_engine: AsyncEngine | None = None,
+    ) -> None:
+        super().__init__(session_factory, debug_enabled, is_retryable_error_fn)
+        self._db_engine = db_engine
 
     @db_operation("create_workflow_parameter")
     async def create_workflow_parameter(
@@ -1267,6 +1295,7 @@ class WorkflowParametersRepository(BaseRepository):
         interaction_id: str,
         response: QuestionResponse,
         *,
+        account_group_decision: AccountGroupDecision | None = None,
         preflight_only: bool = False,
     ) -> QuestionInteraction:
         """Validate before external screening, then recheck and commit the screened reply."""
@@ -1300,7 +1329,7 @@ class WorkflowParametersRepository(BaseRepository):
                 self._store_question_turn(chat, entry)
                 await session.commit()
                 raise ValueError("The question's execution was interrupted")
-            resolved = resolve_question_response(item, response)
+            resolved = resolve_question_response(item, response, account_group_decision)
             if preflight_only:
                 entry.question_client_seen_at = datetime.now(timezone.utc)
                 self._store_question_turn(chat, entry)
@@ -1312,6 +1341,19 @@ class WorkflowParametersRepository(BaseRepository):
             self._store_question_turn(chat, entry)
             await session.commit()
             return resolved
+
+    @db_operation("record_copilot_account_group_submission")
+    async def record_copilot_account_group_submission(
+        self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_group_id: str
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry, item = self._question_in_pending(chat, interaction_id)
+            if item.account_group_review is None:
+                raise ValueError("This question has no account review")
+            item.account_group_review.workflow_run_group_id = workflow_run_group_id
+            self._store_question_turn(chat, entry)
+            await session.commit()
 
     @db_operation("interrupt_copilot_question")
     async def interrupt_copilot_question(
@@ -1348,6 +1390,80 @@ class WorkflowParametersRepository(BaseRepository):
                 self._store_question_turn(chat, entry)
             await session.commit()
             return changed
+
+    @db_operation("record_copilot_steer_message", expected_errors=(ValueError,))
+    async def record_copilot_steer_message(
+        self,
+        organization_id: str,
+        chat_id: str,
+        cancel_token: str,
+        steer_id: str,
+        steer: CopilotSteerMessage | None = None,
+    ) -> CopilotSteerMessage | None:
+        """Validate the running turn before external screening (``steer`` None), then recheck and record.
+
+        An already-recorded ``steer_id`` returns the stored message, so a retry never records twice.
+        """
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry = next(
+                (
+                    candidate
+                    for candidate in map(CopilotPendingTurn.model_validate, (chat.pending_turns or {}).values())
+                    if candidate.cancel_token == cancel_token and candidate.recovering_at is None
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError("The Copilot turn has ended")
+            existing = next((item for item in entry.steer_messages if item.steer_id == steer_id), None)
+            if existing is not None:
+                return existing
+            if len(entry.steer_messages) >= MAX_STEER_MESSAGES_PER_TURN:
+                raise ValueError("This Copilot turn cannot take more messages")
+            if steer is None:
+                return None
+            entry.steer_messages.append(steer)
+            entry.steer_messages.sort(key=lambda item: item.created_at)
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return steer
+
+    @db_operation("undelivered_copilot_steer_ids")
+    async def undelivered_copilot_steer_ids(self, organization_id: str, chat_id: str, turn_id: str) -> set[str]:
+        async with self.Session() as session:
+            pending_turns = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel.pending_turns)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == chat_id)
+                )
+            ).first()
+        raw = (pending_turns or {}).get(turn_id)
+        if raw is None:
+            return set()
+        entry = CopilotPendingTurn.model_validate(raw)
+        return {item.steer_id for item in entry.steer_messages if item.delivered_at is None}
+
+    @db_operation("take_copilot_steer_messages")
+    async def take_copilot_steer_messages(
+        self, organization_id: str, chat_id: str, turn_id: str
+    ) -> list[CopilotSteerMessage]:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            raw = (chat.pending_turns or {}).get(turn_id)
+            if raw is None:
+                return []
+            entry = CopilotPendingTurn.model_validate(raw)
+            undelivered = [item for item in entry.steer_messages if item.delivered_at is None]
+            if not undelivered:
+                return []
+            delivered_at = datetime.now(timezone.utc)
+            for item in undelivered:
+                item.delivered_at = delivered_at
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return undelivered
 
     @db_operation("claim_pending_copilot_turn")
     async def claim_pending_copilot_turn(
@@ -1390,10 +1506,85 @@ class WorkflowParametersRepository(BaseRepository):
             recovering_at = _parse_pending_turn_timestamp(entry.get("recovering_at"))
             if recovering_at is not None and recovering_at > claim_before:
                 return False
+            if await _turn_finalisation_held(session, _turn_finalisation_lock_key(workflow_copilot_chat_id, turn_id)):
+                return False
+            credential_resumed_at = _parse_pending_turn_timestamp(entry.get("credential_resumed_at"))
+            if credential_resumed_at is not None and credential_resumed_at > claim_before:
+                return False
             pending[turn_id] = {**entry, "recovering_at": datetime.now(timezone.utc).isoformat()}
             chat.pending_turns = pending
             await session.commit()
             return True
+
+    @db_operation("record_pending_copilot_turn_credential_resume")
+    async def record_pending_copilot_turn_credential_resume(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+    ) -> None:
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return
+            pending = dict(chat.pending_turns or {})
+            entry = pending.get(turn_id)
+            if not isinstance(entry, dict):
+                return
+            pending[turn_id] = {**entry, "credential_resumed_at": datetime.now(timezone.utc).isoformat()}
+            chat.pending_turns = pending
+            await session.commit()
+
+    @db_operation("claim_pending_copilot_turn_for_finalisation")
+    async def claim_pending_copilot_turn_for_finalisation(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+    ) -> Literal["claimed", "reconciling", "no_marker"]:
+        """ "claimed" means the live handler owns the turn and "reconciling" that reconcile does. Call it inside
+        ``hold_copilot_turn_finalisation``: reconcile cannot claim a turn while that lock is held."""
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return "no_marker"
+            entry = (chat.pending_turns or {}).get(turn_id)
+            if not isinstance(entry, dict):
+                return "no_marker"
+            return "reconciling" if entry.get("recovering_at") is not None else "claimed"
+
+    @asynccontextmanager
+    async def hold_copilot_turn_finalisation(self, workflow_copilot_chat_id: str, turn_id: str) -> AsyncIterator[None]:
+        """Keep reconcile off this turn while the live handler writes its outcome. The lock lives on this
+        transaction's connection, so a dead process releases it and a stalled live one keeps it."""
+        if self._db_engine is None:
+            raise RuntimeError("Copilot turn finalisation locking requires a database engine")
+        key = _turn_finalisation_lock_key(workflow_copilot_chat_id, turn_id)
+        if self._db_engine.dialect.name == "sqlite":
+            _SQLITE_FINALISING_TURNS.add(key)
+            try:
+                yield
+            finally:
+                _SQLITE_FINALISING_TURNS.discard(key)
+            return
+        # A raw connection, never the ambient session: the handler's own writes commit on their own.
+        async with self._db_engine.connect() as connection, connection.begin():
+            await connection.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
+            yield
 
     @db_operation("clear_pending_copilot_turn")
     async def clear_pending_copilot_turn(

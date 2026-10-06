@@ -11,6 +11,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import structlog
 
+from skyvern.forge.sdk.copilot.ask_user import (
+    ACCOUNT_GROUP_CANCEL_TOOL_NAME,
+    ACCOUNT_GROUP_STATUS_TOOL_NAME,
+    ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+)
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import ActivityBucket, NarrativeBlockAttempt, upsert_narrative_block_attempt
 from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
@@ -48,6 +53,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "get_block_schema": "Checking workflow block options",
     "get_workflow_knowledge": "Looking up workflow guidance",
     "list_integrations": "Checking connected integrations",
+    "read_google_sheet": "Reading the Google Sheet",
     "get_organization_usage_quota": "Checking account usage",
     "inspect_current_workflow": "Inspecting workflow",
     "discover_workflow_entrypoint": "Finding the entry page",
@@ -84,12 +90,15 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "start_fresh_browser": "Starting a fresh browser",
     "extend_browser_session": "Extending the browser session",
     "upload_attached_file": "Attaching your file to the page",
-    "run_browser_code": "Running browser code",
+    "run_browser_code": "Working in the browser",
     "edit_block": "Editing block",
     "add_block": "Adding block",
     "delete_block": "Deleting block",
     "request_credential": "Requesting a credential",
     "ask_user": "Asking you",
+    ACCOUNT_GROUP_SUBMIT_TOOL_NAME: "Reviewing the accounts with you",
+    ACCOUNT_GROUP_STATUS_TOOL_NAME: "Checking the account runs",
+    ACCOUNT_GROUP_CANCEL_TOOL_NAME: "Reviewing a cancel with you",
     "set_work_plan": "Updating its plan",
 }
 
@@ -149,6 +158,7 @@ def build_tool_result_activity(
     timestamp: datetime,
     display_label: str | None = None,
     code_diffs: list[CodeWriteDiff] | None = None,
+    browser_steps: list[str] | None = None,
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
@@ -165,6 +175,8 @@ def build_tool_result_activity(
     }
     if code_diffs:
         entry["codeDiffs"] = code_diffs
+    if browser_steps:
+        entry["browserSteps"] = browser_steps
     return entry
 
 

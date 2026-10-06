@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -70,6 +70,8 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunAttemptModel,
     WorkflowRunBlockModel,
     WorkflowRunCredentialSelectionModel,
+    WorkflowRunGroupItemModel,
+    WorkflowRunGroupModel,
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
@@ -92,6 +94,7 @@ from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYT
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import (
+    MIXED_RUN_DEFINITION_DIGEST,
     WorkflowDefinition,
     WorkflowRun,
     WorkflowRunOutputParameter,
@@ -108,6 +111,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 )
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
+from skyvern.schemas.workflows import BlockStatus
 
 LOG = structlog.get_logger()
 
@@ -363,6 +367,23 @@ async def _has_serialized_publication_identity(
             )
         )
     return serialized_publication
+
+
+async def _first_queued_at(
+    session: AsyncSession, workflow_run: WorkflowRunModel, *, sequential_credential_id: str | None = None
+) -> datetime:
+    """A serialized run takes the next org-wide queue ticket; the caller must hold its publication-lane locks."""
+    if await _has_serialized_publication_identity(
+        session,
+        workflow_run,
+        browser_session_id=workflow_run.browser_session_id,
+        browser_address=workflow_run.browser_address,
+        sequential_credential_id=sequential_credential_id,
+    ):
+        return await _allocate_serialized_queue_ticket(
+            session, organization_id=workflow_run.organization_id, workflow_run_id=workflow_run.workflow_run_id
+        )
+    return naive_utc_now()
 
 
 class WorkflowRunsRepository(BaseRepository):
@@ -846,6 +867,7 @@ class WorkflowRunsRepository(BaseRepository):
         copilot_session_id: str | None = None,
         start_fresh_browser: bool | None = None,
         created_by: str | None = None,
+        workflow_definition_sha256: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             kwargs: dict[str, Any] = {}
@@ -860,6 +882,7 @@ class WorkflowRunsRepository(BaseRepository):
                 start_fresh_browser=start_fresh_browser,
                 reuse_browser_session=reuse_browser_session,
                 reuse_bound_key=reuse_bound_key,
+                workflow_definition_sha256=workflow_definition_sha256,
                 proxy_location=serialize_proxy_location(proxy_location),
                 status="created",
                 webhook_callback_url=webhook_callback_url,
@@ -1005,25 +1028,9 @@ class WorkflowRunsRepository(BaseRepository):
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
-                    serialized_publication = await _has_serialized_publication_identity(
-                        session,
-                        workflow_run,
-                        browser_session_id=workflow_run.browser_session_id,
-                        browser_address=workflow_run.browser_address,
-                        sequential_credential_id=sequential_credential_id,
+                    workflow_run.queued_at = await _first_queued_at(
+                        session, workflow_run, sequential_credential_id=sequential_credential_id
                     )
-                    if serialized_publication:
-                        # The caller holds every composed publication-lane lock until this transaction
-                        # commits. Advance beyond every active serialized ticket in the organization,
-                        # so all composed lanes share one comparable clock even when database transaction
-                        # time or an application host clock moved backwards.
-                        workflow_run.queued_at = await _allocate_serialized_queue_ticket(
-                            session,
-                            organization_id=workflow_run.organization_id,
-                            workflow_run_id=workflow_run_id,
-                        )
-                    else:
-                        workflow_run.queued_at = naive_utc_now()
                 if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
                     workflow_run.started_at = naive_utc_now()
                 if status and status.is_final() and workflow_run.finished_at is None:
@@ -1216,19 +1223,17 @@ class WorkflowRunsRepository(BaseRepository):
         run_with: str | None = None,
         ai_fallback: bool | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        only_from: Sequence[WorkflowRunStatus] | None = None,
+        job_id: str | None = None,
+        depends_on_workflow_run_id: str | None = None,
+        workflow_definition_sha256: str | None = None,
     ) -> WorkflowRun | None:
-        """Transition a workflow run to ``status`` only if it is not already in a
-        terminal state. Returns the updated row, or ``None`` when the row was
-        already terminal (or missing). Implemented as a single conditional
-        ``UPDATE ... WHERE status IN (<non-terminal>)`` so a concurrent
-        finalization write cannot be clobbered by a late cancel.
-
-        Mirrors the timestamp side effects of :meth:`update_workflow_run`:
-        ``finished_at`` is stamped on terminal transitions and ``started_at``
-        is stamped on the first ``running`` transition (preserving any
-        existing value via ``COALESCE``).
-        """
-        non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
+        """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
+        cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
+        :meth:`update_workflow_run`."""
+        non_terminal = [
+            s.value for s in WorkflowRunStatus if not s.is_final() and (only_from is None or s in only_from)
+        ]
         now = naive_utc_now()
         values: dict[str, Any] = {"status": status}
         if status.is_final():
@@ -1243,6 +1248,18 @@ class WorkflowRunsRepository(BaseRepository):
             values["ai_fallback"] = ai_fallback
         if failure_category is not None:
             values["failure_category"] = failure_category
+        if job_id:
+            values["job_id"] = job_id
+        if depends_on_workflow_run_id:
+            values["depends_on_workflow_run_id"] = depends_on_workflow_run_id
+        if workflow_definition_sha256 is not None:
+            # Only invalidate: a retry re-enters with the row as it is now while earlier attempts' block rows still
+            # describe the old code, and a NULL digest (a run created before digests) cannot say what those ran.
+            stored = WorkflowRunModel.workflow_definition_sha256
+            values["workflow_definition_sha256"] = case(
+                (and_(stored.is_not(None), stored != workflow_definition_sha256), MIXED_RUN_DEFINITION_DIGEST),
+                else_=stored,
+            )
         # The reopen/reset path clears attribution when it returns the row to `created`, so a
         # later terminal transition starts from SQL NULL and this COALESCE fills the freshly
         # derived document; on any row that already carries one it preserves the first writer.
@@ -1260,6 +1277,14 @@ class WorkflowRunsRepository(BaseRepository):
             )
 
         async with self.Session() as session:
+            if status == WorkflowRunStatus.queued:
+                workflow_run = (
+                    await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
+                ).first()
+                if workflow_run is not None and workflow_run.queued_at is None:
+                    values["queued_at"] = func.coalesce(
+                        WorkflowRunModel.queued_at, await _first_queued_at(session, workflow_run)
+                    )
             result = await session.execute(
                 update(WorkflowRunModel)
                 .where(
@@ -1781,6 +1806,19 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter_by(organization_id=organization_id)
             return await session.scalar(query)
 
+    @db_operation("get_browser_runtime", log_errors=False)
+    async def get_browser_runtime(self, workflow_run_id: str, organization_id: str) -> str | None:
+        """Where the run's browser ran (``local``, ``pbs`` or ``vendor``), once it acquired one.
+
+        Selects the column for the same reason as ``get_secure_runner_pin``: ``WorkflowRun`` is a published schema.
+        """
+        async with self.Session() as session:
+            return await session.scalar(
+                select(WorkflowRunModel.browser_runtime).filter_by(
+                    workflow_run_id=workflow_run_id, organization_id=organization_id
+                )
+            )
+
     @db_operation("get_workflow_run_status", log_errors=False)
     async def get_workflow_run_status(
         self,
@@ -1966,21 +2004,7 @@ class WorkflowRunsRepository(BaseRepository):
             if workflow_run is None:
                 return False
             if workflow_run.status == WorkflowRunStatus.created:
-                queued_at = workflow_run.queued_at
-                if queued_at is None:
-                    serialized_publication = await _has_serialized_publication_identity(
-                        session,
-                        workflow_run,
-                        browser_session_id=workflow_run.browser_session_id,
-                        browser_address=workflow_run.browser_address,
-                    )
-                    queued_at = (
-                        await _allocate_serialized_queue_ticket(
-                            session, organization_id=workflow_run.organization_id, workflow_run_id=workflow_run_id
-                        )
-                        if serialized_publication
-                        else now
-                    )
+                queued_at = workflow_run.queued_at or await _first_queued_at(session, workflow_run)
                 # A cancel committed since the caller's read must win: the status predicate re-evaluates
                 # against the latest committed row.
                 moved = await session.execute(
@@ -2333,6 +2357,55 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter_by(organization_id=organization_id)
             workflow_runs = (await session.scalars(query)).all()
             return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
+
+    @db_operation("get_latest_group_child_run_id")
+    async def get_latest_group_child_run_id(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_id: str,
+        workflow_parameter_id: str,
+        values: Sequence[str],
+        submission_key_suffix: str,
+        completed_without_block_statuses: Collection[BlockStatus] | None,
+    ) -> str | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunGroupItemModel.workflow_run_id)
+                .select_from(WorkflowRunGroupModel)
+                .join(
+                    WorkflowRunGroupItemModel,
+                    WorkflowRunGroupItemModel.workflow_run_group_id == WorkflowRunGroupModel.workflow_run_group_id,
+                )
+                .join(
+                    WorkflowRunParameterModel,
+                    WorkflowRunParameterModel.workflow_run_id == WorkflowRunGroupItemModel.workflow_run_id,
+                )
+                .filter(
+                    WorkflowRunGroupModel.organization_id == organization_id,
+                    WorkflowRunGroupModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowRunGroupModel.workflow_id == workflow_id,
+                    WorkflowRunGroupModel.submission_key.endswith(submission_key_suffix, autoescape=True),
+                    WorkflowRunParameterModel.workflow_parameter_id == workflow_parameter_id,
+                    WorkflowRunParameterModel.value.in_(values),
+                )
+                .order_by(WorkflowRunGroupItemModel.created_at.desc())
+                .limit(1)
+            )
+            if completed_without_block_statuses is not None:
+                query = query.join(
+                    WorkflowRunModel, WorkflowRunModel.workflow_run_id == WorkflowRunGroupItemModel.workflow_run_id
+                ).filter(
+                    WorkflowRunModel.organization_id == organization_id,
+                    WorkflowRunModel.status == WorkflowRunStatus.completed.value,
+                    ~exists().where(
+                        WorkflowRunBlockModel.organization_id == organization_id,
+                        WorkflowRunBlockModel.workflow_run_id == WorkflowRunGroupItemModel.workflow_run_id,
+                        WorkflowRunBlockModel.status.in_([status.value for status in completed_without_block_statuses]),
+                    ),
+                )
+            return await session.scalar(query)
 
     @db_operation("get_last_running_workflow_run")
     async def get_last_running_workflow_run(

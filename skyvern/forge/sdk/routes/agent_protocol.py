@@ -42,7 +42,7 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
-from skyvern.forge.agent_functions import AuditEvent
+from skyvern.forge.agent_functions import AuditEvent, record_request_audit_event
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
@@ -65,6 +65,7 @@ from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
+from skyvern.forge.sdk.core.run_submission_gate import OPENAPI_SHED_RESPONSE, run_submission_slot
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import (
     OrganizationAuthTokenType,
@@ -231,6 +232,22 @@ from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.real_browser_manager import runtime_supports_browser_type_selection
 
 LOG = structlog.get_logger()
+
+# Every OrganizationUpdate input has one corresponding persisted organization field.
+ORGANIZATION_UPDATE_AUDIT_FIELD_MAP = {
+    "slug": "slug",
+    "max_steps_per_run": "max_steps_per_run",
+    "max_steps_per_workflow_run": "max_steps_per_workflow_run",
+    "clear_max_steps_per_workflow_run": "max_steps_per_workflow_run",
+    "max_retries_per_step": "max_retries_per_step",
+    "webhook_callback_url": "webhook_callback_url",
+    "artifact_url_expiry_seconds": "artifact_url_expiry_seconds",
+    "clear_artifact_url_expiry_seconds": "artifact_url_expiry_seconds",
+    "default_llm_key": "default_llm_key",
+    "clear_default_llm_key": "default_llm_key",
+    "default_secondary_llm_key": "default_secondary_llm_key",
+    "clear_default_secondary_llm_key": "default_secondary_llm_key",
+}
 
 FORCE_TASK_V1_MAX_STEPS = 25
 
@@ -660,6 +677,7 @@ def _hydrate_run_request_for_response(
     responses={
         200: {"description": "Successfully ran agent"},
         400: {"description": "Invalid agent run request"},
+        503: OPENAPI_SHED_RESPONSE,
     },
 )
 @base_router.post("/run/agents/", include_in_schema=False)
@@ -693,52 +711,56 @@ async def run_workflow(
     legacy_workflow_request = _workflow_run_request_to_legacy_request(workflow_run_request)
 
     trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
-    try:
-        workflow_run = await workflow_service.run_workflow(
-            workflow_id=workflow_id,
-            organization=current_org,
-            workflow_request=legacy_workflow_request,
-            template=template,
-            version=None,
-            max_steps=x_max_steps_override,
-            api_key=x_api_key,
-            request_id=request_id,
-            request=request,
-            background_tasks=background_tasks,
-            trigger_type=trigger_type,
-            tag_write_context=_tag_write_context_from_caller(caller),
-            created_by=user_id,
+    # The slot covers every database read after dispatch too: a checkout timeout there would answer 500 for
+    # a run that is already queued, and the client's retry would start it twice.
+    async with run_submission_slot(current_org.organization_id):
+        try:
+            workflow_run = await workflow_service.run_workflow(
+                workflow_id=workflow_id,
+                organization=current_org,
+                workflow_request=legacy_workflow_request,
+                template=template,
+                version=None,
+                max_steps=x_max_steps_override,
+                api_key=x_api_key,
+                request_id=request_id,
+                request=request,
+                background_tasks=background_tasks,
+                trigger_type=trigger_type,
+                tag_write_context=_tag_write_context_from_caller(caller),
+                created_by=user_id,
+                refuse_unusable_parameters_before_create=True,
+            )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        await uploaded_file_service.attach_files_to_run(
+            file_ids=workflow_run_request.file_ids or [],
+            organization_id=current_org.organization_id,
+            run_id=workflow_run.workflow_run_id,
         )
-    except MissingBrowserAddressError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    await uploaded_file_service.attach_files_to_run(
-        file_ids=workflow_run_request.file_ids or [],
-        organization_id=current_org.organization_id,
-        run_id=workflow_run.workflow_run_id,
-    )
-    background_tasks.add_task(
-        app.AGENT_FUNCTION.on_run_created,
-        organization_id=current_org.organization_id,
-        run_id=workflow_run.workflow_run_id,
-        run_type=RunType.workflow_run,
-        caller_type=caller.caller_type,
-    )
+        background_tasks.add_task(
+            app.AGENT_FUNCTION.on_run_created,
+            organization_id=current_org.organization_id,
+            run_id=workflow_run.workflow_run_id,
+            run_type=RunType.workflow_run,
+            caller_type=caller.caller_type,
+        )
 
-    if settings.OTEL_ENABLED:
-        span = trace.get_current_span()
-        if span:
-            if workflow_run.workflow_run_id:
-                span.set_attribute("workflow_run_id", workflow_run.workflow_run_id)
-            if workflow_run.workflow_id:
-                span.set_attribute("workflow_id", workflow_run.workflow_id)
+        if settings.OTEL_ENABLED:
+            span = trace.get_current_span()
+            if span:
+                if workflow_run.workflow_run_id:
+                    span.set_attribute("workflow_run_id", workflow_run.workflow_run_id)
+                if workflow_run.workflow_id:
+                    span.set_attribute("workflow_id", workflow_run.workflow_id)
 
-    # Hydrate the returned request from the persisted run: workflow title (when the workflow exists) and
-    # the effective browser_type, so a run that omitted browser_type reports the inherited engine
-    # instead of the request's null.
-    workflow = await app.WORKFLOW_SERVICE.get_workflow(
-        workflow_id=workflow_run.workflow_id,
-        organization_id=current_org.organization_id,
-    )
+        # Hydrate the returned request from the persisted run: workflow title (when the workflow exists) and
+        # the effective browser_type, so a run that omitted browser_type reports the inherited engine
+        # instead of the request's null.
+        workflow = await app.WORKFLOW_SERVICE.get_workflow(
+            workflow_id=workflow_run.workflow_id,
+            organization_id=current_org.organization_id,
+        )
     workflow_run_request_hydrated = _hydrate_run_request_for_response(workflow_run_request, workflow_run, workflow)
 
     return WorkflowRunResponse(
@@ -1657,6 +1679,9 @@ async def create_folder(
         title=data.title,
         description=data.description,
     )
+    await record_request_audit_event(
+        current_org.organization_id, "workflow_folder.create", "workflow_folder", folder_model.folder_id
+    )
     workflow_count = await app.DATABASE.folders.get_folder_workflow_count(
         folder_id=folder_model.folder_id,
         organization_id=current_org.organization_id,
@@ -1836,6 +1861,17 @@ async def update_folder(
     if not folder:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
+    changed_fields = tuple(
+        name for name, value in (("title", data.title), ("description", data.description)) if value is not None
+    )
+    if changed_fields:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "workflow_folder.update",
+            "workflow_folder",
+            folder.folder_id,
+            changed_fields=changed_fields,
+        )
     workflow_count = await app.DATABASE.folders.get_folder_workflow_count(
         folder_id=folder.folder_id,
         organization_id=current_org.organization_id,
@@ -1873,14 +1909,22 @@ async def delete_folder(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict:
     analytics.capture("skyvern-oss-folder-delete")
-    success = await app.DATABASE.folders.soft_delete_folder(
+    deleted_workflow_ids = await app.DATABASE.folders.soft_delete_folder(
         folder_id=folder_id,
         organization_id=current_org.organization_id,
         delete_workflows=delete_workflows,
     )
-    if not success:
+    if deleted_workflow_ids is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
+    await record_request_audit_event(
+        current_org.organization_id,
+        "workflow_folder.delete",
+        "workflow_folder",
+        folder_id,
+        changed_fields=("delete_workflows",) if delete_workflows else (),
+        related_resource_ids=tuple(deleted_workflow_ids),
+    )
     return {"status": "deleted", "folder_id": folder_id, "workflows_deleted": delete_workflows}
 
 
@@ -1920,6 +1964,14 @@ async def update_workflow_folder(
                 status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_permanent_id} not found"
             )
 
+        await record_request_audit_event(
+            current_org.organization_id,
+            "workflow.update",
+            "workflow",
+            workflow.workflow_permanent_id,
+            changed_fields=("folder_id",),
+            related_resource_ids=(workflow.folder_id,) if workflow.folder_id else (),
+        )
         return workflow
     except ValueError as e:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
@@ -1976,22 +2028,24 @@ async def _apply_tag_changes_with_retry(
     label_sets: list[str] | None = None,
     label_deletes: list[str] | None = None,
     colors: dict[str, str] | None = None,
-) -> None:
+) -> bool:
     """Wrap ``apply_tag_changes`` with one IntegrityError retry: concurrent
-    same-identity SETs race the partial UNIQUE; last-write-wins, else 409."""
+    same-identity SETs race the partial UNIQUE; last-write-wins, else 409.
+    Returns whether any tag changed."""
     for attempt in range(2):
         try:
-            await app.DATABASE.tags.apply_tag_changes(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=organization_id,
-                sets=sets,
-                deletes=deletes,
-                context=context,
-                label_sets=label_sets,
-                label_deletes=label_deletes,
-                colors=colors,
+            return bool(
+                await app.DATABASE.tags.apply_tag_changes(
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    sets=sets,
+                    deletes=deletes,
+                    context=context,
+                    label_sets=label_sets,
+                    label_deletes=label_deletes,
+                    colors=colors,
+                )
             )
-            return
         except IntegrityError:
             if attempt == 0:
                 await asyncio.sleep(random.uniform(0.01, 0.05))
@@ -2000,6 +2054,7 @@ async def _apply_tag_changes_with_retry(
                 status_code=http_status.HTTP_409_CONFLICT,
                 detail="Tag write conflicted with a concurrent update; please retry",
             )
+    return False
 
 
 async def _apply_run_tag_changes_with_retry(
@@ -2012,22 +2067,23 @@ async def _apply_run_tag_changes_with_retry(
     label_sets: list[str] | None = None,
     label_deletes: list[str] | None = None,
     colors: dict[str, str] | None = None,
-) -> None:
+) -> bool:
     """Wrap ``apply_run_tag_changes`` with the same concurrency behavior as
     workflow tags. Org-mismatch is mapped to the route-level 404 contract."""
     for attempt in range(2):
         try:
-            await app.DATABASE.tags.apply_run_tag_changes(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                sets=sets,
-                deletes=deletes,
-                context=context,
-                label_sets=label_sets,
-                label_deletes=label_deletes,
-                colors=colors,
+            return bool(
+                await app.DATABASE.tags.apply_run_tag_changes(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    sets=sets,
+                    deletes=deletes,
+                    context=context,
+                    label_sets=label_sets,
+                    label_deletes=label_deletes,
+                    colors=colors,
+                )
             )
-            return
         except RunTagWorkflowRunMismatch as e:
             raise HTTPException(
                 status_code=http_status.HTTP_404_NOT_FOUND,
@@ -2041,6 +2097,7 @@ async def _apply_run_tag_changes_with_retry(
                 status_code=http_status.HTTP_409_CONFLICT,
                 detail="Tag write conflicted with a concurrent update; please retry",
             )
+    return False
 
 
 async def _rename_tag_value_with_retry(
@@ -2128,7 +2185,7 @@ async def apply_workflow_tags(
     grouped_deletes: set[str] = {d.key for d in data.tags_to_delete if d.key is not None}
     label_deletes: list[str] = [d.value for d in data.tags_to_delete if d.key is None and d.value is not None]
     try:
-        await _apply_tag_changes_with_retry(
+        tags_changed = await _apply_tag_changes_with_retry(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
             sets=grouped_sets,
@@ -2142,6 +2199,10 @@ async def apply_workflow_tags(
         # Cap-breach is the only ValueError surfaced; treat as 422 (user input).
         raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
+    if tags_changed:
+        await record_request_audit_event(
+            organization_id, "workflow.update", "workflow", workflow_permanent_id, changed_fields=("tags",)
+        )
     return await _build_tags_response(workflow_permanent_id, organization_id)
 
 
@@ -2178,13 +2239,17 @@ async def delete_workflow_tag(
     await _assert_workflow_in_org(workflow_permanent_id, organization_id)
 
     write_ctx = _tag_write_context_from_caller(caller)
-    await _apply_tag_changes_with_retry(
+    tags_changed = await _apply_tag_changes_with_retry(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
         sets={},
         deletes={key},
         context=write_ctx,
     )
+    if tags_changed:
+        await record_request_audit_event(
+            organization_id, "workflow.update", "workflow", workflow_permanent_id, changed_fields=("tags",)
+        )
     return await _build_tags_response(workflow_permanent_id, organization_id)
 
 
@@ -2321,7 +2386,7 @@ async def apply_run_tags(
     grouped_deletes: set[str] = {d.key for d in data.tags_to_delete if d.key is not None}
     label_deletes: list[str] = [d.value for d in data.tags_to_delete if d.key is None and d.value is not None]
     try:
-        await _apply_run_tag_changes_with_retry(
+        tags_changed = await _apply_run_tag_changes_with_retry(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             sets=grouped_sets,
@@ -2334,6 +2399,10 @@ async def apply_run_tags(
     except ValueError as e:
         raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
+    if tags_changed:
+        await record_request_audit_event(
+            organization_id, "workflow_run.update", "workflow_run", workflow_run_id, changed_fields=("tags",)
+        )
     return await _build_run_tags_response(workflow_run_id, organization_id)
 
 
@@ -2367,13 +2436,17 @@ async def delete_run_tag(
     _validate_path_key(key)
 
     write_ctx = _tag_write_context_from_caller(caller)
-    await _apply_run_tag_changes_with_retry(
+    tags_changed = await _apply_run_tag_changes_with_retry(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
         sets={},
         deletes={key},
         context=write_ctx,
     )
+    if tags_changed:
+        await record_request_audit_event(
+            organization_id, "workflow_run.update", "workflow_run", workflow_run_id, changed_fields=("tags",)
+        )
     return await _build_run_tags_response(workflow_run_id, organization_id)
 
 
@@ -2521,6 +2594,7 @@ async def update_tag_key(
     )
     if row is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
+    await record_request_audit_event(organization_id, "tag.update", "tag", row.key, changed_fields=("description",))
     # Populate the real count so PATCH and GET /tag-keys agree (the ORM row
     # has no count attribute, so model_validate would default it to 0).
     counts = await app.DATABASE.tags.count_active_workflows_per_key(organization_id=organization_id)
@@ -2559,6 +2633,7 @@ async def delete_tag_key(
     )
     if delete_result is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
+    await record_request_audit_event(organization_id, "tag.delete", "tag", key)
     return TagKeyDeleteResponse(
         key=key,
         removed_from_workflow_count=delete_result.removed_from_workflow_count,
@@ -2632,6 +2707,7 @@ async def create_tag_value(
         )
     except TagValueAlreadyExists as e:
         raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(e)) from e
+    await record_request_audit_event(current_org.organization_id, "tag.create", "tag", f"{row.key}:{row.value}")
     return TagValue(key=row.key, value=row.value, color=row.color, workflow_count=0)
 
 
@@ -2671,6 +2747,9 @@ async def update_tag_value(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Tag value '{key}:{data.value}' not found",
         )
+    await record_request_audit_event(
+        organization_id, "tag.update", "tag", f"{row.key}:{row.value}", changed_fields=("color",)
+    )
     count = await app.DATABASE.tags.count_active_workflows_for_value(
         organization_id=organization_id, key=row.key, value=row.value
     )
@@ -2720,6 +2799,14 @@ async def rename_tag_value(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Tag value '{key}:{data.value}' not found",
         )
+    await record_request_audit_event(
+        caller.organization.organization_id,
+        "tag.update",
+        "tag",
+        f"{result.key}:{result.value}",
+        changed_fields=("value",),
+        related_resource_ids=(f"{key}:{data.value}",),
+    )
     return TagValueRenameResponse(
         key=result.key,
         value=result.value,
@@ -2766,6 +2853,7 @@ async def delete_tag_value(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Tag value '{key}:{data.value}' not found",
         )
+    await record_request_audit_event(organization_id, "tag.delete", "tag", f"{key}:{data.value}")
     return TagValueDeleteResponse(
         key=key,
         value=data.value,
@@ -3159,6 +3247,13 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.DOWNLOAD: "application/octet-stream",
 }
 _ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
+_HTML_ARTIFACT_TYPES = frozenset(
+    artifact_type
+    for artifact_type, content_type in _ARTIFACT_CONTENT_TYPES.items()
+    if content_type.startswith("text/html")
+)
+# Scraped pages are third-party HTML served inline from the API origin; sandbox them so their scripts never run.
+_HTML_ARTIFACT_CSP = "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
 _VIDEO_CONTENT_TYPES_BY_EXTENSION = {
     ".mp4": "video/mp4",
     ".webm": "video/webm",
@@ -3408,6 +3503,8 @@ async def get_artifact_content(
         signed_expiry_unix=signed_expiry_unix,
     )
     headers["Accept-Ranges"] = "bytes"
+    if artifact.artifact_type in _HTML_ARTIFACT_TYPES:
+        headers["Content-Security-Policy"] = _HTML_ARTIFACT_CSP
     content_length = len(content)
     parsed_range = _parse_range_header(request.headers.get("range"), content_length)
     if parsed_range == _RANGE_UNSATISFIABLE:
@@ -4019,6 +4116,7 @@ def _user_writable_run_metadata(run_metadata: dict[str, str] | None) -> dict[str
         200: {"description": "Successfully retried workflow run"},
         400: {"description": "Workflow run is not retryable"},
         404: {"description": "Workflow run not found"},
+        503: OPENAPI_SHED_RESPONSE,
     },
 )
 @base_router.post("/workflows/runs/{workflow_run_id}/retry/", include_in_schema=False)
@@ -4115,25 +4213,26 @@ async def retry_workflow_run(
         if is_job_recipe_workflow_run_trigger_type(original_trigger_type)
         else workflow_run_trigger_type_from_user_agent(x_user_agent)
     )
-    try:
-        workflow_run = await workflow_service.run_workflow(
-            workflow_id=original_workflow_run.workflow_permanent_id,
-            organization=current_org,
-            workflow_request=legacy_workflow_request,
-            template=template,
-            version=original_workflow.version,
-            max_steps=x_max_steps_override,
-            api_key=x_api_key,
-            request_id=context.request_id,
-            request=request,
-            background_tasks=background_tasks,
-            trigger_type=trigger_type,
-            ignore_inherited_workflow_system_prompt=original_workflow_run.ignore_inherited_workflow_system_prompt,
-            tag_write_context=_tag_write_context_from_caller(caller),
-            created_by=user_id,
-        )
-    except MissingBrowserAddressError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    async with run_submission_slot(current_org.organization_id):
+        try:
+            workflow_run = await workflow_service.run_workflow(
+                workflow_id=original_workflow_run.workflow_permanent_id,
+                organization=current_org,
+                workflow_request=legacy_workflow_request,
+                template=template,
+                version=original_workflow.version,
+                max_steps=x_max_steps_override,
+                api_key=x_api_key,
+                request_id=context.request_id,
+                request=request,
+                background_tasks=background_tasks,
+                trigger_type=trigger_type,
+                ignore_inherited_workflow_system_prompt=original_workflow_run.ignore_inherited_workflow_system_prompt,
+                tag_write_context=_tag_write_context_from_caller(caller),
+                created_by=user_id,
+            )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     background_tasks.add_task(
         app.AGENT_FUNCTION.on_run_created,
         organization_id=current_org.organization_id,
@@ -4719,6 +4818,7 @@ async def get_actions(
     openapi_extra={
         "x-fern-sdk-method-name": "run_workflow_legacy",
     },
+    responses={503: OPENAPI_SHED_RESPONSE},
 )
 @legacy_base_router.post(
     "/workflows/{workflow_id}/run/",
@@ -4753,24 +4853,26 @@ async def run_workflow_legacy(
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
     legacy_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
-    try:
-        workflow_run = await workflow_service.run_workflow(
-            workflow_id=workflow_id,
-            organization=current_org,
-            workflow_request=workflow_request,
-            template=template,
-            version=version,
-            max_steps=x_max_steps_override,
-            api_key=x_api_key,
-            request_id=request_id,
-            request=request,
-            background_tasks=background_tasks,
-            trigger_type=legacy_trigger_type,
-            tag_write_context=_tag_write_context_from_caller(caller),
-            created_by=user_id,
-        )
-    except MissingBrowserAddressError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    async with run_submission_slot(current_org.organization_id):
+        try:
+            workflow_run = await workflow_service.run_workflow(
+                workflow_id=workflow_id,
+                organization=current_org,
+                workflow_request=workflow_request,
+                template=template,
+                version=version,
+                max_steps=x_max_steps_override,
+                api_key=x_api_key,
+                request_id=request_id,
+                request=request,
+                background_tasks=background_tasks,
+                trigger_type=legacy_trigger_type,
+                tag_write_context=_tag_write_context_from_caller(caller),
+                created_by=user_id,
+                refuse_unusable_parameters_before_create=True,
+            )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     background_tasks.add_task(
         app.AGENT_FUNCTION.on_run_created,
         organization_id=current_org.organization_id,
@@ -5461,11 +5563,19 @@ async def set_workflow_template_status(
     Template status is stored at the workflow_permanent_id level (not per-version),
     meaning all versions of a workflow share the same template status.
     """
-    return await app.WORKFLOW_SERVICE.set_template_status(
+    result = await app.WORKFLOW_SERVICE.set_template_status(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         is_template=is_template,
     )
+    await record_request_audit_event(
+        current_org.organization_id,
+        "workflow.update",
+        "workflow",
+        workflow_permanent_id,
+        changed_fields=("is_template",),
+    )
+    return result
 
 
 @legacy_base_router.get(
@@ -5678,6 +5788,13 @@ async def reset_workflow_browser_profile(
             message="Failed to clear the persisted browser profile. Please retry the reset operation.",
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
         ) from exc
+    await record_request_audit_event(
+        current_org.organization_id,
+        "workflow.update",
+        "workflow",
+        workflow_permanent_id,
+        changed_fields=("saved_browser_profile",),
+    )
 
 
 @legacy_base_router.post(
@@ -5850,6 +5967,18 @@ async def update_organization(
                 detail=f"{field_name} must reference a valid custom LLM for this organization",
             )
 
+    stored_org = await app.DATABASE.organizations.get_organization(current_org.organization_id)
+    comparison_org = stored_org or current_org
+    changed_fields: set[str] = set()
+    for request_field, organization_field in ORGANIZATION_UPDATE_AUDIT_FIELD_MAP.items():
+        requested_value = getattr(org_update, request_field)
+        if request_field.startswith("clear_"):
+            changed = requested_value and getattr(comparison_org, organization_field) is not None
+        else:
+            changed = requested_value is not None and requested_value != getattr(comparison_org, organization_field)
+        if changed:
+            changed_fields.add(organization_field)
+
     try:
         updated = await app.DATABASE.organizations.update_organization(
             current_org.organization_id,
@@ -5876,6 +6005,14 @@ async def update_organization(
         ) from exc
 
     org_auth_service.invalidate_cached_org(current_org.organization_id)
+    if changed_fields:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "organization.settings.update",
+            "organization",
+            current_org.organization_id,
+            changed_fields=tuple(sorted(changed_fields)),
+        )
     return updated
 
 

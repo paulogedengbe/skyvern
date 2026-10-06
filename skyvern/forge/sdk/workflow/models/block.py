@@ -119,7 +119,7 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import OUTPUT_ONLY_ANTI_BOT_REASON_CODES, classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -208,6 +208,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     bind_inline_attach_authorized_file,
     capture_authorized_file,
     inline_authorized_file_path,
+    pin_file_chooser,
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
@@ -291,6 +292,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
@@ -1924,14 +1926,21 @@ class Block(BaseModel, abc.ABC):
         pass
 
 
+def _is_retry_blocking_anti_bot_entry(category: dict) -> bool:
+    return (
+        category.get("category") == "ANTI_BOT_DETECTION"
+        and category.get("reason_code") not in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
+    )
+
+
 def _should_skip_retry_on_anti_bot_detection(task: Task) -> bool:
     categories = task.failure_category
     if categories:
-        return any(c.get("category") == "ANTI_BOT_DETECTION" for c in categories)
+        return any(_is_retry_blocking_anti_bot_entry(c) for c in categories)
 
     if task.failure_reason:
         result = classify_from_failure_reason(task.failure_reason)
-        if result and any(c.get("category") == "ANTI_BOT_DETECTION" for c in result):
+        if result and any(_is_retry_blocking_anti_bot_entry(c) for c in result):
             return True
 
     return False
@@ -1941,6 +1950,10 @@ def _engine_is_unset(engine: RunEngine | None) -> bool:
     return engine is None
 
 
+def _engine_pin_is_unset(engine_pinned: bool) -> bool:
+    return not engine_pinned
+
+
 class BaseTaskBlock(Block):
     task_type: str = TaskType.general
     url: str | None = None
@@ -1948,6 +1961,9 @@ class BaseTaskBlock(Block):
     # Left out of the dump when unset, so a stored definition stays readable by an image whose engine
     # field still rejects null (a rollout or a revert).
     engine: RunEngine | None = Field(default=None, exclude_if=_engine_is_unset)
+    # A person chose skyvern-1.0. Before the chosen-engine cutoff a stored skyvern-1.0 without this is
+    # usually the old editor's spelling of Default, so only a marked one is honored as a pin.
+    engine_pinned: bool = Field(default=False, exclude_if=_engine_pin_is_unset)
     complete_criterion: str | None = None
     complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
@@ -2039,7 +2055,7 @@ class BaseTaskBlock(Block):
         the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
         engine is honored as-authored, and a block the eligibility check never saw is left alone;
         neither is ever rerouted. An unset engine routes like skyvern_v1, except in a run that honors the
-        chosen engine, where an explicit skyvern_v1 is a pin too.
+        chosen engine or on a block whose skyvern_v1 a person pinned.
         """
         declared = self.engine or RunEngine.skyvern_v1
         if (
@@ -2053,7 +2069,7 @@ class BaseTaskBlock(Block):
         ):
             return declared
         if self.engine is not None and (
-            self.engine != RunEngine.skyvern_v1 or run_honors_chosen_engine(workflow_run_id)
+            self.engine != RunEngine.skyvern_v1 or self.engine_pinned or run_honors_chosen_engine(workflow_run_id)
         ):
             return self.engine
         return workflow_block_engine_override(workflow_run_id) or declared
@@ -6772,6 +6788,13 @@ class CodeBlock(Block):
             download_log=download_log,
             locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
             registered_downloads=registered_downloads,
+            file_chooser=pin_file_chooser(_raw_code_block_page(page)),
+            # Taken before execute_user_function_with_timeout starts its clock, so it errs early.
+            deadline=(
+                monotonic() + settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
+                if settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS > 0
+                else None
+            ),
         )
         safe_vars["open_page"] = _bind_code_block_open_page(
             page, opened_pages if opened_pages is not None else [], browser_state
@@ -8585,10 +8608,14 @@ async def wrapper({default_args}):
             return "".join(char for char in redacted if unicodedata.category(char)[0] != "C").strip()[:1000] or None
 
         state: dict[str, str] = {}
+        first_url: str | None = None
+        later_url: str | None = None
+        page_title: str | None = None
         try:
             async with asyncio.timeout(0.5):
                 try:
-                    final_url = mask_fact(page.url)
+                    first_url = page.url
+                    final_url = mask_fact(first_url)
                     if final_url:
                         state["final_url"] = final_url
                 except asyncio.CancelledError:
@@ -8597,12 +8624,15 @@ async def wrapper({default_args}):
                     pass
                 try:
                     page_title = mask_fact(await page.title())
-                    if page_title:
-                        state["page_title"] = page_title
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - failure evidence is best effort.
                     pass
+                finally:
+                    with contextlib.suppress(Exception):
+                        later_url = page.url
+                        if later_url != first_url and (later_final_url := mask_fact(later_url)):
+                            state["final_url"] = later_final_url
                 try:
                     receiver_url = mask_fact(receiver.url) if receiver is not None else None
                     if receiver_url:
@@ -8624,6 +8654,9 @@ async def wrapper({default_args}):
             raise
         except TimeoutError:
             pass
+        # A document committed after the first url read would pair one document's URL with another's title.
+        if page_title and first_url is not None and later_url == first_url:
+            state["page_title"] = page_title
         return state
 
     async def _persist_captured_failure_final_url(
@@ -9981,7 +10014,7 @@ async def wrapper({default_args}):
                     failure_page=failed_page,
                     workflow_run_context=workflow_run_context,
                     redaction_parameters=serialized_parameter_values,
-                    opened_pages=opened_pages,
+                    opened_pages=[*opened_pages, *recording_page._claimed_popups()],
                 )
             if inline_failure_page_state:
                 from skyvern.forge.sdk.workflow.models.code_block_recorder import append_failure_page_state
@@ -11032,7 +11065,9 @@ class DownloadToS3Block(Block):
         uri = None
         try:
             uri = self._get_s3_uri(uploads_organization_id, workflow_run_id)
-            await self._upload_file_to_s3(uri, file_path, cleanup_file=not self.url.startswith("/"))
+            input_path = parse_uri_to_path(self.url) if urlparse(self.url).scheme == "file" else self.url
+            is_original_file = os.path.isabs(input_path) and os.path.realpath(input_path) == os.path.realpath(file_path)
+            await self._upload_file_to_s3(uri, file_path, cleanup_file=not is_original_file)
         except Exception as e:
             LOG.error("DownloadToS3Block Failed to upload file to S3", uri=uri, error=str(e))
             raise e
@@ -15995,31 +16030,26 @@ class HttpRequestBlock(Block):
     # Parameters for templating
     parameters: list[PARAMETER_TYPE] = []
 
-    # Allowed directories for local file access (class variable, not a Pydantic field)
-    _allowed_dirs: ClassVar[list[str] | None] = None
     _confined_references: list[tuple[str, str | None, str, str]] = PrivateAttr(default_factory=list)
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"body", "download_filename", "files", "headers", "url"})
 
-    @classmethod
-    def get_allowed_dirs(cls) -> list[str]:
-        """Get the list of allowed directories for local file access.
-        Computed once and cached for performance.
-        """
-        if cls._allowed_dirs is None:
-            allowed_dirs: list[str] = []
-            if settings.ARTIFACT_STORAGE_PATH:
-                allowed_dirs.append(os.path.abspath(settings.ARTIFACT_STORAGE_PATH))
-            if settings.VIDEO_PATH:
-                allowed_dirs.append(os.path.abspath(settings.VIDEO_PATH))
-            if settings.HAR_PATH:
-                allowed_dirs.append(os.path.abspath(settings.HAR_PATH))
-            if settings.LOG_PATH:
-                allowed_dirs.append(os.path.abspath(settings.LOG_PATH))
-            if settings.DOWNLOAD_PATH:
-                allowed_dirs.append(os.path.abspath(settings.DOWNLOAD_PATH))
-            cls._allowed_dirs = allowed_dirs
-        return cls._allowed_dirs or []
+    @staticmethod
+    def get_allowed_dirs(workflow_run_id: str, organization_id: str | None) -> list[str]:
+        run_download_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id)
+        allowed_dirs = [
+            os.path.realpath(download_dir_path_for_run(run_id))
+            for run_id in dict.fromkeys((workflow_run_id, run_download_id))
+            if run_id
+        ]
+        if organization_id and settings.ARTIFACT_STORAGE_PATH:
+            artifact_root = settings.ARTIFACT_STORAGE_PATH
+            allowed_dirs += [
+                os.path.realpath(os.path.join(artifact_root, settings.ENV, organization_id)),
+                os.path.realpath(os.path.join(artifact_root, organization_id)),
+                os.path.realpath(os.path.join(artifact_root, "downloads", settings.ENV, organization_id)),
+            ]
+        return allowed_dirs
 
     def get_all_parameters(
         self,
@@ -16382,7 +16412,7 @@ class HttpRequestBlock(Block):
                 self.headers["Content-Type"] = "application/json"
 
         # Download files from HTTP URLs or S3 URIs if needed
-        # Also allow local files from allowed directories (ARTIFACT_STORAGE_PATH, VIDEO_PATH, HAR_PATH, LOG_PATH)
+        # Local files are allowed only inside this run's download dir or the org's local artifact dirs
         if self.files:
             downloaded_files: dict[str, str] = {}
             for field_name, file_path in self.files.items():
@@ -16413,26 +16443,17 @@ class HttpRequestBlock(Block):
                     file_path.startswith("s3://") or file_path.startswith("gs://") or file_path.startswith("azure://")
                 )
 
-                # Check if file is in allowed directories
                 is_allowed_local_file = False
-                if actual_file_path:
-                    # Convert to absolute path for comparison (handles both absolute and relative paths)
-                    abs_file_path = os.path.abspath(actual_file_path)
-
-                    # Get allowed directory paths (using class method for cached result)
-                    allowed_dirs = self.get_allowed_dirs()
-                    LOG.debug("HttpRequestBlock Allowed directories", allowed_dirs=allowed_dirs)
-
-                    # Check if file is within any allowed directory
-                    for allowed_dir in allowed_dirs:
-                        # Use os.path.commonpath to check if file is within allowed directory
+                if actual_file_path and not (is_url or is_managed_storage_uri):
+                    # realpath first so a symlink or ".." cannot point the containment check at another tree.
+                    resolved_file_path = os.path.realpath(actual_file_path)
+                    for allowed_dir in self.get_allowed_dirs(workflow_run_id, organization_id):
                         try:
-                            common_path = os.path.commonpath([abs_file_path, allowed_dir])
-                            if common_path == allowed_dir:
+                            if os.path.commonpath([resolved_file_path, allowed_dir]) == allowed_dir:
                                 is_allowed_local_file = True
+                                actual_file_path = resolved_file_path
                                 break
                         except ValueError:
-                            # Paths are on different drives (Windows) or incompatible
                             continue
 
                 # If not URL, managed storage URI, or allowed local file, reject
@@ -18571,18 +18592,11 @@ class WorkflowTriggerBlock(Block):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
-    async def _check_trigger_depth(self, workflow_run_id: str) -> int:
-        """Check the nesting depth of workflow triggers to prevent infinite recursion.
-
-        Note: This depth guard walks the parent_workflow_run_id chain, which is only
-        populated for synchronous triggers. For async (fire-and-forget) dispatch, the
-        parent may have already completed before the child runs, so circular async
-        chains (A->B->A) are only blocked while A is still running. A full
-        visited-workflow guard would require persistent state and is left as a future
-        enhancement.
-        """
+    async def _check_trigger_depth(self, workflow_run_id: str) -> str:
+        """Return the root run of the parent_workflow_run_id chain, raising past MAX_TRIGGER_DEPTH. An async child's
+        parent may finish first, so a circular async chain (A->B->A) is blocked only while A is still running."""
         depth = 0
-        current_run_id: str | None = workflow_run_id
+        current_run_id = workflow_run_id
         while current_run_id:
             if depth >= self.MAX_TRIGGER_DEPTH:
                 raise InvalidWorkflowDefinition(
@@ -18594,7 +18608,7 @@ class WorkflowTriggerBlock(Block):
                 break
             current_run_id = run.parent_workflow_run_id
             depth += 1
-        return depth
+        return current_run_id
 
     def _render_template_value(
         self,
@@ -18817,9 +18831,16 @@ class WorkflowTriggerBlock(Block):
 
         # 2. Check recursion depth
         try:
-            await self._check_trigger_depth(workflow_run_id)
+            root_workflow_run_id = await self._check_trigger_depth(workflow_run_id)
         except InvalidWorkflowDefinition as e:
             return await _fail(str(e))
+        if (
+            not self.wait_for_completion or self.browser_session_id
+        ) and await app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id(root_workflow_run_id):
+            return await _fail(
+                "A workflow run group child cannot trigger a workflow without waiting for it"
+                " or into a supplied browser session"
+            )
 
         # 3. Get the organization
         if not organization_id:
@@ -18894,6 +18915,7 @@ class WorkflowTriggerBlock(Block):
                     organization_id=organization_id,
                     proxy_location=proxy_location,
                     timeout_minutes=30,
+                    session_kind=BrowserSessionKind.workflow_run,
                     **child_session_kwargs,
                 )
                 resolved_browser_session_id = child_browser_session.persistent_browser_session_id
@@ -19209,7 +19231,7 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
             continue
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
             continue
-        if block.engine not in (None, RunEngine.skyvern_v1):
+        if block.engine not in (None, RunEngine.skyvern_v1) or _pins_v1(block):
             return V3AbIneligibleReason.pinned_engine
         if not _task_block_supports_v3(block):
             return V3AbIneligibleReason.unsupported_block
@@ -19219,6 +19241,15 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
     if reroutable_blocks == 0:
         return V3AbIneligibleReason.no_reroutable_blocks
     return None
+
+
+def _pins_v1(block: BaseTaskBlock) -> bool:
+    return block.engine == RunEngine.skyvern_v1 and block.engine_pinned
+
+
+def pinned_v1_block_count(blocks: list[BlockTypeVar]) -> int:
+    """How many blocks of the flattened definition carry a person's skyvern-1.0 pin."""
+    return sum(1 for block in blocks if isinstance(block, BaseTaskBlock) and _pins_v1(block))
 
 
 def takes_default_engine(blocks: list[BlockTypeVar]) -> bool | None:

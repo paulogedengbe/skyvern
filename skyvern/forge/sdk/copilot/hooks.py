@@ -103,6 +103,8 @@ class CopilotRunHooks(RunHooksBase):
         system_prompt: str | None,
         input_items: list[TResponseInputItem],
     ) -> None:
+        self._ctx.model_call_in_flight = True
+        self._ctx.model_call_streamed_tool_call = False
         try:
             self._ctx.model_calls_this_turn += 1
             if self._ctx.eval_mode == "browser_ablation" and isinstance(system_prompt, str):
@@ -114,6 +116,7 @@ class CopilotRunHooks(RunHooksBase):
             )
 
     async def on_llm_end(self, context: RunContextWrapper, agent: Agent, response: ModelResponse) -> None:
+        self._ctx.model_call_in_flight = False
         if self._ctx.check_model_work_deadline is not None:
             self._ctx.check_model_work_deadline()
         try:
@@ -213,6 +216,17 @@ class CopilotRunHooks(RunHooksBase):
                     and isinstance(integration.get("scopes_granted"), list)
                 ]
                 activity_entry["integrations"] = integrations
+
+            if tool_name == "read_google_sheet" and parsed.get("ok"):
+                data = parsed.get("data") or {}
+                rows = data.get("connections", []) if isinstance(data, dict) else []
+                activity_entry["opened_connection_ids"] = [
+                    row["connection_id"]
+                    for row in (rows if isinstance(rows, list) else [])
+                    if isinstance(row, dict)
+                    and row.get("status") == "opened"
+                    and isinstance(row.get("connection_id"), str)
+                ]
 
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}

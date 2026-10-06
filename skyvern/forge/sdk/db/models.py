@@ -80,6 +80,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
     generate_workflow_run_credential_selection_id,
+    generate_workflow_run_group_id,
     generate_workflow_run_id,
     generate_workflow_schedule_id,
     generate_workflow_script_id,
@@ -820,6 +821,62 @@ class WorkflowScheduleModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class WorkflowRunGroupModel(Base):
+    __tablename__ = "workflow_run_groups"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "submission_key", name="uq_workflow_run_groups_org_submission_key"),
+        Index(
+            "idx_workflow_run_groups_unfinished_modified_at",
+            "modified_at",
+            postgresql_where=text("status IN ('active', 'cancel_requested')"),
+        ),
+    )
+
+    workflow_run_group_id = Column(String, primary_key=True, default=generate_workflow_run_group_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    requested_version = Column(Integer, nullable=True)
+    workflow_id = Column(String, nullable=False)
+    submission_key = Column(String, nullable=False)
+    input_fingerprint = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="active")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    finished_at = Column(DateTime, nullable=True)
+
+
+class WorkflowRunGroupItemModel(Base):
+    __tablename__ = "workflow_run_group_items"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_group_id", "item_key", name="uq_workflow_run_group_items_group_item_key"),
+        UniqueConstraint("workflow_run_id", name="uq_workflow_run_group_items_workflow_run_id"),
+        Index("ix_workflow_run_group_items_item_key_created_at", "item_key", "created_at"),
+    )
+
+    workflow_run_group_id = Column(String, primary_key=True)
+    position = Column(Integer, primary_key=True)
+    item_key = Column(String, nullable=False)
+    parameters = Column(JSON, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="pending")
+    dispatch_token = Column(String, nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    dispatch_attempts = Column(Integer, nullable=False, default=0)
+    failure_reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
 class WorkflowTemplateModel(Base):
     """
     Tracks which workflows are marked as templates.
@@ -896,6 +953,7 @@ class WorkflowRunModel(Base):
     start_fresh_browser = Column(Boolean, nullable=True)
     reuse_browser_session = Column(Boolean, nullable=True)
     reuse_bound_key = Column(String, nullable=True)
+    workflow_definition_sha256 = Column(String, nullable=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)
@@ -1872,6 +1930,15 @@ class CredentialModel(Base):
 
 class DebugSessionModel(Base):
     __tablename__ = "debug_sessions"
+    __table_args__ = (
+        Index(
+            "ix_debug_sessions_org_wpid_user_created_at",
+            "organization_id",
+            "workflow_permanent_id",
+            "user_id",
+            "created_at",
+        ),
+    )
 
     debug_session_id = Column(String, primary_key=True, default=generate_debug_session_id)
     organization_id = Column(String, nullable=False)

@@ -90,7 +90,7 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
-from skyvern.forge.failure_classifier import FailureCategory, classify_from_failure_reason
+from skyvern.forge.failure_classifier import FailureCategory, classify_from_failure_reason, is_captcha_solve_failure
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
@@ -167,6 +167,7 @@ from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import unusable_browser_session_error
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import parse_totp_config
@@ -187,6 +188,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, Wo
 from skyvern.forge.sdk.workflow.page_derived_templates import NO_RENDER_RECORD, UNVERIFIED_ROOT_CLASSES
 from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.goal_check import (
+    BLOCK_COMPLETION_CHECK_PROMPT_NAME,
     GOAL_CHECK_PROMPT_NAME,
     PRE_JUDGE_SKIP_REASONS,
     GoalJudge,
@@ -196,12 +198,10 @@ from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
-    CUSTOMER_PRECEDENCE_FLAG,
     DATE_SEGMENT_AIM_FLAG,
-    EXTRACTION_REPORTS_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
-    HUMANIZED_INPUT_FLAG,
+    LOGIN_PACE_FLAG,
     resolve_run_arm,
     run_arm_enabled,
 )
@@ -249,6 +249,7 @@ from skyvern.utils.secret_redaction import (
     redact_har_bytes,
     redact_secrets_from_text,
 )
+from skyvern.utils.stall_watch import log_if_stalled
 from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
@@ -332,6 +333,11 @@ EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS = 3
 _CLAIMED_DOWNLOAD_GRACE_POLL_SECONDS = 1.0
 _V3_BLANK_PAGE_SETTLE_POLLS = 8
 _V3_BLANK_PAGE_SETTLE_POLL_SECONDS = 0.25
+
+# Healthy steps finish well inside 20 minutes, so a step still running after that is logged with where it is
+# waiting, then again every 30 minutes.
+STEP_STALL_LOG_FIRST_AFTER_SECONDS = 20 * 60
+STEP_STALL_LOG_REPEAT_EVERY_SECONDS = 30 * 60
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
@@ -568,7 +574,7 @@ _RUN_TYPE_BY_ENGINE: dict[RunEngine, str] = {
 
 
 _PAGE_FINGERPRINT_PROBE_JS = (
-    "() => {" + OTP_INPUT_PRIVACY_JS + " if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
+    "(maskTicks) => {" + OTP_INPUT_PRIVACY_JS + " if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
     " const mix = (str, seed) => { let x = seed;"
     " for (let i = 0; i < str.length; i++) x = (Math.imul(x, 31) + str.charCodeAt(i)) | 0; return x; };"
     # The act-by-mark tag is OUR writing and it now outlives the action, so a page that never
@@ -577,8 +583,21 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     # mark after mark, which is precisely the run the stall detector exists to catch.
     # OTP bookkeeping attributes must also be ignored after masking so stamps do not count as page progress.
     ' const scrub = (s) => s.replace(/ data-(?:tv3-act|tv3-cover|tv3-pick|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
-    " const walk = (root) => { h = mix(scrub(otpSafeHtml(root, true)), h);"
+    # Each sample scores every element's own text, capped at 2: +1 when rewritten, -1 when unchanged, 0 when it grew.
+    # From 2 until back at 0 it is a ticker, and the settle check (maskTicks) ignores a ticker's change only to a
+    # text whose digit-masked shape it has shown before: a countdown, a clock or a carousel, never a new word.
+    " let seen = window.__tv3_settle_text;"
+    " if (!(seen instanceof WeakMap)) seen = window.__tv3_settle_text = new WeakMap();"
+    " const own = (n) => { let t = ''; for (const c of n.childNodes) if (c.nodeType === 3) t += c.nodeValue; return t; };"
+    " const walk = (root) => { const html = scrub(otpSafeHtml(root, true)); let text = 0;"
     " const all = root.querySelectorAll('*'); elems += all.length;"
+    " for (const el of [root, ...all]) { const t = own(el); const r = seen.get(el); if (!r && !t.trim()) continue;"
+    " const shape = t.replace(/[0-9]+/g, '#');"
+    " if (!r) seen.set(el, { t: t, n: 0, s: new Set([shape]) }); else if (r.t === t) r.n = Math.max(0, r.n - 1);"
+    " else { r.n = t.length > r.t.length && t.startsWith(r.t.slice(0, -3)) ? 0 : Math.min(2, r.n + 1); r.t = t; }"
+    " if (r) r.k = r.n >= 2 || (!!r.k && r.n > 0); if (!(r && r.k && r.s.has(shape))) text = mix('|' + t, text);"
+    " if (r && r.s.size < 16) r.s.add(shape); }"
+    " h = mix(maskTicks ? ('>' + html + '<').replace(/>[^<]*</g, '><') + ':' + text : html, h);"
     " for (const el of root.querySelectorAll('input, textarea, select'))"
     " v = mix((isOtpInputValueSecret(el) ? '*' : String(el.value || '')) + '|' + (el.checked === true ? '1' : '0'), v);"
     " for (const el of all) { if (el.shadowRoot) walk(el.shadowRoot); } };"
@@ -1403,6 +1422,7 @@ def _build_task_v3_goal_judge(
     browser_state: BrowserState,
     peek_page: Callable[[], Awaitable[Any]],
     shot_holder: list[bytes],
+    prompt_name: str = GOAL_CHECK_PROMPT_NAME,
 ) -> GoalJudge:
     handler = LLMAPIHandlerFactory.get_llm_api_handler(judge_key)
 
@@ -1421,12 +1441,14 @@ def _build_task_v3_goal_judge(
                 engine_selection=browser_state.engine_selection,
             )
         except Exception:
-            LOG.warning("taskv3 goal check screenshot failed", task_id=task.task_id, exc_info=True)
+            LOG.warning(
+                "taskv3 goal check screenshot failed", task_id=task.task_id, prompt_name=prompt_name, exc_info=True
+            )
             return None
         shot_holder.append(shot)
         response = await handler(
             prompt=prompt,
-            prompt_name=GOAL_CHECK_PROMPT_NAME,
+            prompt_name=prompt_name,
             step=step,
             screenshots=[shot],
         )
@@ -2162,6 +2184,9 @@ class ForgeAgent:
             )
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=task_request.browser_session_id)
+            unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+            if unusable is not None:
+                raise unusable
 
         task = await app.DATABASE.tasks.create_task(
             url=str(task_request.url),
@@ -2240,8 +2265,6 @@ class ForgeAgent:
             DEFAULT_DEADLINE_SECONDS,
             MAX_TOKENS_CEILING,
             MIN_ACTION_STEPS,
-            USER_INSTRUCTIONS_END,
-            USER_INSTRUCTIONS_LABEL,
             coerce_v3_parameters,
             run_task_v3_agent_loop,
             taskv3_runaway_backstops,
@@ -2324,32 +2347,12 @@ class ForgeAgent:
             )
             await resolve_run_arm(
                 context,
-                CUSTOMER_PRECEDENCE_FLAG,
+                LOGIN_PACE_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
-                forced=settings.TASK_V3_CUSTOMER_PRECEDENCE,
-                properties={
-                    "workflow_permanent_id": task.workflow_permanent_id
-                    or context.workflow_permanent_id
-                    or "not_workflow"
-                },
+                forced=settings.TASK_V3_LOGIN_PACE,
+                properties={"workflow_permanent_id": task.workflow_permanent_id or context.workflow_permanent_id or ""},
             )
-            await resolve_run_arm(
-                context,
-                EXTRACTION_REPORTS_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_EXTRACTION_REPORTS,
-            )
-            await resolve_run_arm(
-                context,
-                HUMANIZED_INPUT_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_HUMANIZED_INPUT,
-            )
-            # Here as well as on the loop's finish line, so a run whose loop raises still records its profile.
-            LOG.info("Task V3 humanized input resolved", **input_dispatch.arm_fields())
         # The judge's finish-time screenshot, reused as the decision screenshot of an accepted completion.
         goal_judge_shot: list[bytes] = []
         page_free_validation = bool(
@@ -2402,7 +2405,6 @@ class ForgeAgent:
             handoff_enabled=handoff_enabled,
             previous_block=previous_block,
             selected_block_labels=context.run_block_labels if context else None,
-            extraction_reports=run_arm_enabled(EXTRACTION_REPORTS_FLAG, settings.TASK_V3_EXTRACTION_REPORTS),
         )
         # Surface the customer's completion/termination criteria (trusted task config, like the navigation
         # goal). Withhold a complete_criterion flagged untrusted (LLM-derived from page content) so it can't be
@@ -2417,29 +2419,20 @@ class ForgeAgent:
             "terminate_criterion": task.terminate_criterion,
         }
 
-        def _compose_goal(fields: dict[str, str | None], page_data_note: bool = False) -> str:
-            return compose_goal(
-                fields["navigation_goal"] or "",
-                GoalDirectives(
-                    data_extraction_goal=fields["data_extraction_goal"],
-                    extracted_information_schema=task.extracted_information_schema,
-                    complete_criterion=fields["complete_criterion"],
-                    terminate_criterion=fields["terminate_criterion"],
-                    # Validation only: that is the task type whose criteria a decision-maker weighs against
-                    # each other in both engines, and the only one this was measured on (SKY-16193).
-                    criteria_precedence=task.task_type == TaskType.validation,
-                    framing=framing,
-                    block_context_section=block_context_section,
-                    page_data_note=page_data_note,
-                    code_progress=recovery_code_progress,
-                ),
-            )
-
-        goal = _compose_goal(goal_fields)
-        # The precedence arm grants the goal and criteria the user's authority; a value a page produced must
-        # not share it. The goal judge reads this same goal, so it too sees page values as quoted data.
-        customer_precedence_on = not page_free_validation and run_arm_enabled(
-            CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE
+        goal = compose_goal(
+            goal_fields["navigation_goal"] or "",
+            GoalDirectives(
+                data_extraction_goal=goal_fields["data_extraction_goal"],
+                extracted_information_schema=task.extracted_information_schema,
+                complete_criterion=goal_fields["complete_criterion"],
+                terminate_criterion=goal_fields["terminate_criterion"],
+                # Validation only: that is the task type whose criteria a decision-maker weighs against
+                # each other in both engines, and the only one this was measured on (SKY-16193).
+                criteria_precedence=task.task_type == TaskType.validation,
+                framing=framing,
+                block_context_section=block_context_section,
+                code_progress=recovery_code_progress,
+            ),
         )
         block_renders = task_block.page_derived_renders if task_block is not None else {}
         page_derived_renders = {
@@ -2458,14 +2451,6 @@ class ForgeAgent:
             if workflow_run_context is not None and task.workflow_system_prompt
             else {}
         )
-        if customer_precedence_on and presented_fields:
-            goal = _compose_goal(
-                {
-                    name: shown.text if (shown := presented_fields.get(name)) else value
-                    for name, value in goal_fields.items()
-                },
-                page_data_note=any(shown.spans for shown in presented_fields.values()),
-            )
         if presented_fields or system_prompt_page_roots:
             withheld = {
                 name: shown.reason or shown.presentation
@@ -2490,12 +2475,10 @@ class ForgeAgent:
                 "taskv3 page-derived template",
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
-                customer_precedence_arm=customer_precedence_on,
                 page_derived_fields=sorted(name for name, roots in root_classes.items() if roots),
                 root_classes=root_classes,
                 presentation={name: shown.presentation for name, shown in presented_fields.items()},
                 span_count=sum(shown.spans for shown in presented_fields.values()),
-                customer_precedence_withheld="page_derived_unmarked" if withheld else None,
                 withheld_reasons=withheld,
             )
 
@@ -2542,6 +2525,8 @@ class ForgeAgent:
                 if workflow_run and workflow_run.status in (WorkflowRunStatus.canceled, WorkflowRunStatus.timed_out):
                     return True
             return False
+
+        input_dispatch.start_login_pace(_should_cancel)
 
         download_id = resolve_run_download_id(context, fallback_run_id=task.task_id)
         attempt_started_at = await get_download_retry_started_at(
@@ -2915,11 +2900,11 @@ class ForgeAgent:
             " return window.__skyvern_doc_nonce; }"
         )
 
-        async def _page_fingerprint() -> str | None:
+        async def _page_fingerprint(mask_ticks: bool = False) -> str | None:
             peek = await _fingerprint_page()
             if peek is None:
                 return None
-            own = await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
+            own = await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS, mask_ticks)
             # The completion-side settle deferral rides this, and it is a LIVE gate rather than only the
             # shadow stall measurement: a main-frame-only fingerprint reads a page whose child frame is
             # still rendering as settled. When work can happen in a frame, whatever judges that work has
@@ -2934,12 +2919,15 @@ class ForgeAgent:
             parts = [own or ""]
             for frame in frames:
                 try:
-                    parts.append(str(await frame.evaluate(_PAGE_FINGERPRINT_PROBE_JS) or ""))
+                    parts.append(str(await frame.evaluate(_PAGE_FINGERPRINT_PROBE_JS, mask_ticks) or ""))
                 except Exception:
                     # A frame that will not answer contributes nothing rather than costing the page's
                     # own fingerprint -- the deferral still has the main document to judge.
                     LOG.debug("taskv3 page fingerprint could not read a child frame", exc_info=True)
             return "\n".join(parts)
+
+        async def _settle_fingerprint() -> str | None:
+            return await _page_fingerprint(mask_ticks=True)
 
         # Document identity, not content: a failed call's leftover text or open menu changes the DOM
         # without re-mapping other selectors, while a navigation or reload (which does) wipes the nonce.
@@ -3047,16 +3035,7 @@ class ForgeAgent:
                 captcha_tools, captcha_guidance = build_captcha_tools(
                     task, _page_provider, organization_id=organization.organization_id
                 )
-            # Page-free runs never get the precedence paragraph, so the label would have nothing to refer to.
             workflow_system_guidance = task.workflow_system_prompt
-            # A prompt that reads a page-derived value keeps control semantics: it is not presented as the user's.
-            if (
-                workflow_system_guidance
-                and not page_free_validation
-                and run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE)
-                and not system_prompt_page_roots
-            ):
-                workflow_system_guidance = USER_INSTRUCTIONS_LABEL + workflow_system_guidance + USER_INSTRUCTIONS_END
             block_type = str(task_block.block_type) if task_block is not None else None
             extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
             goal_judge: GoalJudge | None = None
@@ -3131,6 +3110,39 @@ class ForgeAgent:
                             peek_page=_fingerprint_page,
                             shot_holder=goal_judge_shot,
                         )
+            # A block that completes on a download is not done by its one action.
+            single_action_block = isinstance(task_block, ActionBlock) and not task_block.complete_on_download
+            block_completion_judge: GoalJudge | None = None
+            if single_action_block:
+                # The run's own model, outside the goal-check arm's payload; its non-flex twin, as flex queueing
+                # outlasts the judge's timeout. Without a judge the block's step-cap completion is never offered.
+                # The registry key: an OpenRouter caller rewrites llm_key to the bare model id.
+                run_key = llm_caller.original_llm_key
+                twin_key = app.AGENT_FUNCTION.get_standard_tier_twin_llm_key(run_key)
+                block_judge_key = twin_key if twin_key and LLMConfigRegistry.is_registered(twin_key) else run_key
+                block_judge_skip = (
+                    "screenshots_disabled"
+                    if context is not None and not context.llm_screenshots_enabled_for_prompt()
+                    else _goal_judge_key_skip_reason(block_judge_key)
+                )
+                if block_judge_skip is not None:
+                    LOG.info(
+                        "taskv3 block completion judge skipped",
+                        task_id=task.task_id,
+                        reason=block_judge_skip,
+                        judge_key=block_judge_key,
+                    )
+                else:
+                    assert block_judge_key is not None
+                    block_completion_judge = _build_task_v3_goal_judge(
+                        judge_key=block_judge_key,
+                        task=task,
+                        step=step,
+                        browser_state=browser_state,
+                        peek_page=_fingerprint_page,
+                        shot_holder=[],
+                        prompt_name=BLOCK_COMPLETION_CHECK_PROMPT_NAME,
+                    )
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
                 resolve_typed_text=resolve_typed_text,
@@ -3138,6 +3150,7 @@ class ForgeAgent:
                 resolve_totp_placeholder=verification_state.resolve_totp_placeholder,
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
+                settle_fingerprint=_settle_fingerprint,
                 page_probe=_page_probe,
                 document_identity=_document_identity,
                 reload_page=_reload_page,
@@ -3165,7 +3178,9 @@ class ForgeAgent:
                 ),
                 goal_check_redactor=(
                     (lambda: _task_v3_goal_check_redactor(task, context))
-                    if goal_judge is not None or unlisted_reask_criteria is not None
+                    if goal_judge is not None
+                    or block_completion_judge is not None
+                    or unlisted_reask_criteria is not None
                     else None
                 ),
                 unlisted_reask_criteria=unlisted_reask_criteria,
@@ -3219,11 +3234,12 @@ class ForgeAgent:
                 caller_known_urls=verdict_known_urls,
                 label_secret_values=_label_secret_values,
                 login_identifier_tokens=_login_identifier_tokens,
-                # A block that completes on a download is not done by its one action.
-                single_action_block=isinstance(task_block, ActionBlock) and not task_block.complete_on_download,
+                single_action_block=single_action_block,
+                block_completion_judge=block_completion_judge,
                 code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
             )
         finally:
+            input_dispatch.end_login_pace()
             if context and credential_parameter_key is not None:
                 context.active_credential_parameter_key = prev_active_credential_parameter_key
             # Frames are already in memory, so a loop that raised or ran out of budget still
@@ -3932,19 +3948,27 @@ class ForgeAgent:
             if engine in [RunEngine.anthropic_cua, RunEngine.ui_tars, RunEngine.yutori_navigator] and llm_caller:
                 LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
 
-            step, detailed_output = await self.agent_step(
-                task,
-                step,
-                browser_state,
-                organization=organization,
-                task_block=task_block,
-                complete_verification=complete_verification,
-                engine=engine,
-                cua_response=cua_response,
-                llm_caller=llm_caller,
-                attempt_started_at=attempt_started_at,
-                list_files_before=list_files_before,
-            )
+            with log_if_stalled(
+                "Agent step still running",
+                first_after_seconds=STEP_STALL_LOG_FIRST_AFTER_SECONDS,
+                repeat_every_seconds=STEP_STALL_LOG_REPEAT_EVERY_SECONDS,
+                step_phase="agent_step",
+                step_id=step.step_id,
+                step_order=step.order,
+            ):
+                step, detailed_output = await self.agent_step(
+                    task,
+                    step,
+                    browser_state,
+                    organization=organization,
+                    task_block=task_block,
+                    complete_verification=complete_verification,
+                    engine=engine,
+                    cua_response=cua_response,
+                    llm_caller=llm_caller,
+                    attempt_started_at=attempt_started_at,
+                    list_files_before=list_files_before,
+                )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
             # Shadow-only loop-stall observability; never raises, never terminates (see shadow.py).
@@ -4031,21 +4055,29 @@ class ForgeAgent:
                     return step, detailed_output, None
             elif step.status == StepStatus.completed:
                 # TODO (kerem): keep the task object uptodate at all times so that clean_up_task can just use it
-                (
-                    is_task_completed,
-                    maybe_last_step,
-                    maybe_next_step,
-                ) = await self.handle_completed_step(
-                    organization=organization,
-                    task=task,
-                    step=step,
-                    page=await browser_state.get_working_page(),
-                    task_block=task_block,
-                    browser_state=browser_state,
-                    scraped_page=detailed_output.scraped_page if detailed_output else None,
-                    engine=engine,
-                    complete_verification=complete_verification,
-                )
+                with log_if_stalled(
+                    "Agent step still running",
+                    first_after_seconds=STEP_STALL_LOG_FIRST_AFTER_SECONDS,
+                    repeat_every_seconds=STEP_STALL_LOG_REPEAT_EVERY_SECONDS,
+                    step_phase="handle_completed_step",
+                    step_id=step.step_id,
+                    step_order=step.order,
+                ):
+                    (
+                        is_task_completed,
+                        maybe_last_step,
+                        maybe_next_step,
+                    ) = await self.handle_completed_step(
+                        organization=organization,
+                        task=task,
+                        step=step,
+                        page=await browser_state.get_working_page(),
+                        task_block=task_block,
+                        browser_state=browser_state,
+                        scraped_page=detailed_output.scraped_page if detailed_output else None,
+                        engine=engine,
+                        complete_verification=complete_verification,
+                    )
                 # Flush here (after handle_completed_step) so that verification LLM artifacts
                 # from check_user_goal_complete/complete_verify are included in the same
                 # step archive as the rest of the step data.
@@ -4468,6 +4500,37 @@ class ForgeAgent:
                 )
         return latest_status
 
+    @staticmethod
+    def _latest_unsolved_captcha(steps: list[Step]) -> str | None:
+        """The captcha-solve failure the run was still stuck on, read from its last two steps that ran actions.
+
+        Two steps cover a failed captcha step and the retry after it. A later successful solve clears it, as does a
+        later success of the same action on the same element: an input-setup captcha guard reports its solve as an
+        abort of that input.
+        """
+        acted = [step.output.actions_and_results for step in steps if step.output and step.output.actions_and_results]
+        later_successful_targets: set[tuple[ActionType, str | None]] = set()
+        for actions_and_results in reversed(acted[-2:]):
+            for action, results in reversed(actions_and_results):
+                target = (action.action_type, action.element_id)
+                for result in reversed(results):
+                    if result.success:
+                        later_successful_targets.add(target)
+                    elif is_captcha_solve_failure(result.exception_type):
+                        solved_later = target in later_successful_targets or any(
+                            action_type == ActionType.SOLVE_CAPTCHA for action_type, _ in later_successful_targets
+                        )
+                        return None if solved_later else result.exception_type
+        return None
+
+    async def _unsolved_captcha_exception(self, task: Task) -> str | None:
+        try:
+            steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+            return self._latest_unsolved_captcha(steps)
+        except Exception:
+            LOG.warning("Failed to read steps for captcha evidence", task_id=task.task_id, exc_info=True)
+            return None
+
     async def _enrich_failure_reason_with_download_status(self, task: Task, reason: str) -> str:
         """Append one bounded sentence to a terminal failure reason when the run's latest download-intent
         action received no file and passively observed a server 5xx status.
@@ -4527,6 +4590,15 @@ class ForgeAgent:
                 reason = redact_secrets_from_text(reason, run_secrets)
 
             failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
+            if any(category.get("category") == FailureCategory.BROWSER_ERROR for category in failure_category or []):
+                unsolved_captcha_exception = await self._unsolved_captcha_exception(task)
+                if unsolved_captcha_exception:
+                    failure_category = classify_from_failure_reason(
+                        reason,
+                        exception=exception,
+                        fallback_to_unknown=True,
+                        unsolved_captcha_exception=unsolved_captcha_exception,
+                    )
             LOG.info(
                 "Task failure classified",
                 task_id=task.task_id,
